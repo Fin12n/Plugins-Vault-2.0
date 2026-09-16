@@ -1,0 +1,58 @@
+{
+  "name": "plugin-vault-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-sql-assets.mjs",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/src/index.js",
+    "deploy-commands": "tsx scripts/deploy-commands.ts",
+    "simulate-payment": "tsx scripts/simulate-sepay-payment.ts",
+    "set-price": "tsx scripts/set-deposit-price.ts",
+    "rescan-purchased": "tsx scripts/rescan-purchased.ts",
+    "check-accounts": "tsx scripts/check-spigot-accounts.ts",
+    "reset-spigot-state": "tsx scripts/reset-spigot-state.ts",
+    "tidy-names": "tsx scripts/tidy-plugin-names.ts",
+    "typecheck": "tsc --noEmit",
+    "docs:web": "node scripts/build-docs-site.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dashboard:build": "npm --prefix dashboard run build",
+    "spigot-login": "tsx scripts/spigot-login.ts",
+    "spigot-refresh": "tsx scripts/spigot-refresh-cookies.ts",
+    "spigot-fetch": "tsx scripts/spigot-fetch-and-upload.ts",
+    "spigot-probe-purchased": "tsx scripts/spigot-probe-purchased.ts",
+    "spigot-probe-download": "tsx scripts/probe-live-download.ts",
+    "spigot-probe-captcha": "tsx scripts/yescaptcha-probe.ts",
+    "accounts-to-json": "tsx scripts/spigot-accounts-to-json.ts",
+    "download-worker": "tsx scripts/download-worker.ts",
+    "dashboard-only": "tsx scripts/dashboard-only.ts",
+    "setup:linux": "bash scripts/setup-linux.sh"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/multipart": "^10.1.0",
+    "@fastify/static": "^10.1.2",
+    "better-sqlite3": "^13.0.2",
+    "content-disposition": "^1.0.0",
+    "discord.js": "^14.24.1",
+    "fastify": "^5.11.2",
+    "fastify-raw-body": "^5.0.0",
+    "node-stream-zip": "^1.16.0",
+    "puppeteer-real-browser": "1.4.4",
+    "yaml": "^2.9.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/content-disposition": "^0.5.9",
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

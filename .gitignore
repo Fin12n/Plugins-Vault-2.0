@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+.pnpm-store/
+
+# Production build outputs
+dist/
+dashboard/dist/
+*.tsbuildinfo
+
+# Large archives, tarballs, binaries
+kho-plugin.tar
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.deb
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+spigot-credentials.json
+spigot-credentials.*.json
+spigot-accounts.json
+spigot-accounts.*.json
+spigot-proxies.txt
+spigot-proxies.*.txt
+
+# Databases, uploads, and runtime state
+data/
+vault/
+tmp/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.gemini/
+scratch/

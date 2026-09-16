@@ -1,0 +1,42 @@
+# Kho Plugin — dựng bằng một lệnh: docker compose up -d
+#
+# Cổng chỉ mở ra 127.0.0.1. Dashboard mở được ví, đơn hàng và toàn bộ kho jar bằng
+# một mật khẩu, nên nó phải đứng sau reverse proxy có HTTPS chứ không phơi thẳng ra
+# internet. Cách dựng proxy nằm ở docs/huong-dan-su-dung.md mục 5.
+
+services:
+  kho-plugin:
+    build: .
+    image: kho-plugin:latest
+    container_name: kho-plugin
+    restart: unless-stopped
+
+    env_file: .env
+    environment:
+      # Trong container luôn nghe 3000; đổi cổng phía host bằng HOST_PORT trong .env.
+      PORT: 3000
+      # Mật khẩu Spigot và cookie phiên phải nằm trong volume, không thì mỗi lần
+      # `docker compose build` là mất sạch và bot phải đăng nhập lại từ đầu 26 lần.
+      SPIGOT_CREDENTIALS_FILE: ${SPIGOT_CREDENTIALS_FILE:-./data/spigot-credentials.json}
+      SPIGOT_ACCOUNTS_FILE: ${SPIGOT_ACCOUNTS_FILE:-./data/spigot-accounts.json}
+
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3000}:3000"
+
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+
+    # Chrome sinh cả cây tiến trình con cho mỗi lượt tải. Không có init thì tiến
+    # trình zombie tích lại trong container cho tới khi hết pid.
+    init: true
+
+    # Chrome đã chạy với --disable-dev-shm-usage, nhưng 1 GB /dev/shm vẫn rẻ hơn
+    # một lượt tải chết giữa đường vì hết bộ nhớ chia sẻ.
+    shm_size: 1gb
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

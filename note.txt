@@ -1,0 +1,16 @@
+[+] Website
+- Landing Page - Trang chủ Shop, Giới thiệu các mặt hàng,...
+- Shop Page - List all products, Filter by category, Search, Cart, Checkout, Payment.
+- Services Page  - Dịch vụ, Mô tả dịch vụ, Giá dịch vụ, Hình thức giao dịch.
+- Signup Page - Signup with Discord, Email/Pass, Google, Github,...
+- Login Page - Login with Discord, Email/Pass, Google, Github,...
+- Admin Dashboard - Dashboard, Products, Orders, Users, Settings (✅ Upgrade more now!)
+- Discount Code - Tạo mã giảm giá, Áp dụng mã giảm giá, Tính toán giảm giá, Quản lý mã giảm giá
+- Role & Permission - Phân quyền theo nhóm
+- Profile
+- Redeem Code
+
+[+] Bot Discord
+
+- Link Website Profile to Discord User (Download all products u buyed)
+- Sync Roles from Website to Discord Server (if user is gold on website, bot will give gold role on discord)

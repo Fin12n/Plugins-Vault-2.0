@@ -1,0 +1,29 @@
+[Unit]
+Description=Kho Plugin Discord Bot & Web Vault
+After=network.target network-online.target systemd-timesyncd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vault
+Group=vault
+# Thư mục chứa mã nguồn của bot (sửa lại nếu bạn đặt ở đường dẫn khác)
+WorkingDirectory=/srv/plugin-vault-bot
+ExecStart=/usr/bin/node dist/src/index.js
+Restart=on-failure
+RestartSec=10
+# Lượt quét/tải Spigot đang chạy được cho tối đa 30 giây để hoàn tất lưu tệp trước khi dừng
+TimeoutStopSec=30
+KillMode=mixed
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/srv/plugin-vault-bot
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Tăng giới hạn file descriptor cho kết nối HTTP và SQLite WAL
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

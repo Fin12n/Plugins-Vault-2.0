@@ -1,0 +1,37 @@
+# Ngữ cảnh build chỉ cần nguồn: mọi thứ dưới đây làm image phình hoặc rò rỉ dữ liệu.
+node_modules
+dashboard/node_modules
+dist
+dashboard/dist
+.git
+.github
+.gitignore
+.gitattributes
+
+# Dữ liệu chạy thật — phải nằm ở volume, không được nướng vào image
+data
+vault
+tmp
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Bí mật: mật khẩu Spigot, khoá phiên, webhook. Chỉ .env.example được vào.
+.env
+.env.*
+!.env.example
+spigot-credentials.json
+spigot-credentials.*.json
+spigot-accounts.json
+spigot-accounts.*.json
+spigot-proxies.txt
+spigot-proxies.*.txt
+
+# Chrome tải trong lúc build, không copy bản .deb 140 MB vào ngữ cảnh
+*.deb
+
+# Tài liệu bản web và test không cần trong image
+docs/web
+tests
+*.tsbuildinfo
