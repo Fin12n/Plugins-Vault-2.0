@@ -31,7 +31,6 @@ import {
 } from 'lucide-react';
 import { useToast } from '../components/toast.js';
 import { RefreshButton, TimeAgo } from '../components/ui.js';
-import { InstanceMonitor } from '../components/instance-monitor.js';
 import { formatTimestamp, vi } from '../i18n/vi.js';
 import {
   api,
@@ -44,8 +43,6 @@ import {
   type SweepLogEntry,
   type SweepLogsResponse,
   type SweepLogLevel,
-  type InstancesResponse,
-  type InstanceWorkerState,
   type SpigotOwnershipOverview,
   type OwnedPluginSummary,
 } from '../lib/api-client.js';
@@ -111,10 +108,6 @@ export function SpigotAccountsPage() {
   const [stoppingDownloads, setStoppingDownloads] = useState(false);
   const [rotatingProxy, setRotatingProxy] = useState(false);
   const [logs, setLogs] = useState<SweepLogEntry[]>([]);
-  const [selectedWorkerLog, setSelectedWorkerLog] = useState<number | 'all'>('all');
-  const [instances, setInstances] = useState<InstanceWorkerState[]>([]);
-  const [concurrency, setConcurrency] = useState<number>(2);
-  const [activeWorkers, setActiveWorkers] = useState<number>(0);
   const [autoScroll, setAutoScroll] = useState(true);
   const [isExpanded, setIsExpanded] = useState(false);
   const [accountTab, setAccountTab] = useState<'current' | 'import'>('current');
@@ -183,40 +176,12 @@ export function SpigotAccountsPage() {
     }
   };
 
-  const fetchInstances = async () => {
+  const fetchLogsAndStatus = async () => {
     try {
-      const res = await api.get<InstancesResponse>('/api/spigot-downloads/instances');
-      setConcurrency(res.concurrency);
-      setActiveWorkers(res.activeWorkers);
-      setInstances(res.instances);
-    } catch {
-      // ignore
-    }
-  };
-
-  const handleConcurrencyChange = async (newConcurrency: number) => {
-    try {
-      const res = await api.post<{ ok: boolean; concurrency: number }>('/api/spigot-downloads/concurrency', {
-        concurrency: newConcurrency,
-      });
-      setConcurrency(res.concurrency);
-      toast.show('success', `Đã cập nhật số luồng tải song song sang ${res.concurrency} worker(s)`);
-      await fetchInstances();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Không thể cập nhật số luồng song song');
-    }
-  };
-
-  const fetchLogsAndStatus = async (targetWorker?: number | 'all') => {
-    try {
-      const activeFilter = targetWorker !== undefined ? targetWorker : selectedWorkerLog;
-      const url =
-        activeFilter !== 'all'
-          ? `/api/spigot-downloads/logs?workerId=${activeFilter}`
-          : '/api/spigot-downloads/logs';
-      const res = await api.get<SweepLogsResponse>(url);
+      const res = await api.get<SweepLogsResponse>('/api/spigot-downloads/logs');
       setRun({
         running: res.running,
+        currentOperation: res.currentOperation ?? (res.running ? 'downloading' : 'idle'),
         lastStartedAt: res.lastStartedAt,
         lastFinishedAt: res.lastFinishedAt,
       });
@@ -277,9 +242,8 @@ export function SpigotAccountsPage() {
     try {
       await api.post<{ ok: boolean; stopped: boolean }>('/api/spigot-downloads/stop');
       setRun({ running: false, lastStartedAt: run?.lastStartedAt ?? null, lastFinishedAt: Date.now() });
-      toast.show('info', '🛑 Đã gửi lệnh DỪNG KHẨN CẤP toàn bộ các luồng Chrome và tiến trình tải!');
+      toast.show('info', '🛑 Đã gửi lệnh DỪNG KHẨN CẤP trình duyệt Chrome và tiến trình tải!');
       await fetchLogsAndStatus();
-      await fetchInstances();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Không thể dừng tiến trình');
     } finally {
@@ -289,15 +253,9 @@ export function SpigotAccountsPage() {
 
   const clearLogs = async () => {
     try {
-      const body = selectedWorkerLog !== 'all' ? { workerId: selectedWorkerLog } : {};
-      await api.post('/api/spigot-downloads/logs/clear', body);
+      await api.post('/api/spigot-downloads/logs/clear', {});
       setLogs([]);
-      toast.show(
-        'info',
-        selectedWorkerLog !== 'all'
-          ? `Đã xóa nhật ký của Worker #${selectedWorkerLog}`
-          : 'Đã xóa toàn bộ nhật ký quét & tải',
-      );
+      toast.show('info', 'Đã xóa toàn bộ nhật ký quét & tải');
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Không thể xóa log');
     }
@@ -306,23 +264,17 @@ export function SpigotAccountsPage() {
   useEffect(() => {
     void refresh().catch(() => setCurrent(null));
     void fetchOwnership();
-    void fetchLogsAndStatus(selectedWorkerLog);
-    void fetchInstances();
+    void fetchLogsAndStatus();
     void api.get<SpigotChallengeStatus>('/api/spigot-challenge').then(setChallenge).catch(() => setChallenge(null));
   }, []);
-
-  useEffect(() => {
-    void fetchLogsAndStatus(selectedWorkerLog);
-  }, [selectedWorkerLog]);
 
   useEffect(() => {
     const interval = run?.running ? 1200 : 3500;
     const timer = window.setInterval(() => {
       void fetchLogsAndStatus();
-      void fetchInstances();
     }, interval);
     return () => window.clearInterval(timer);
-  }, [run?.running, selectedWorkerLog]);
+  }, [run?.running]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -456,75 +408,83 @@ export function SpigotAccountsPage() {
 
             <p className="hub-desc">{vi.spigotAccounts.runHint}</p>
 
-            <div className="hub-action-row" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-              {/* Nút 1: Run Scan Now (Chỉ quét danh sách đã mua của các tài khoản) */}
+            <div className="hub-action-row">
+              {/* Nút 1: Run Scan Now (Chỉ quét danh sách đã mua & liên kết tài khoản) */}
               <button
-                className="btn-hero-run"
+                className="btn-hero-pill btn-pill-scan"
                 onClick={() => void runScanNow()}
-                disabled={run?.running || current?.configured !== true}
-                aria-busy={run?.running === true}
-                title="Quét trang Purchased Resources của tất cả tài khoản Spigot để cập nhật danh sách plugin đã mua (KHÔNG tải file)"
-                style={{
-                  background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
-                  boxShadow: '0 4px 15px rgba(2, 132, 199, 0.4)',
-                }}
+                disabled={run?.running || run?.currentOperation === 'downloading' || current?.configured !== true}
+                aria-busy={run?.currentOperation === 'scanning'}
+                title={
+                  run?.currentOperation === 'downloading'
+                    ? 'Chức năng Quét tạm thời bị khóa vì đang có tiến trình Tải plugin'
+                    : 'CHỈ quét danh mục plugin đã mua tuần tự theo ID tài khoản (Xoá sạch dấu vết sau mỗi tài khoản, KHÔNG tải file JAR)'
+                }
               >
-                <Search size={18} />
-                <span>🔍 Quét Tài Khoản Ngay (Run Scan Now)</span>
+                {run?.currentOperation === 'scanning' ? (
+                  <>
+                    <RefreshCw size={16} className="spin-icon" />
+                    <span>Đang quét tài khoản...</span>
+                  </>
+                ) : (
+                  <>
+                    <Search size={16} />
+                    <span>Quét Tài Khoản Ngay</span>
+                  </>
+                )}
               </button>
 
-              {/* Nút 2: Run Download Now (Tải tuần tự theo từng tài khoản -> plugin -> 10 bản) */}
+              {/* Nút 2: Run Download Now (Chỉ tải plugin ĐÃ LIÊN KẾT sở hữu) */}
               <button
-                className="btn-hero-run"
+                className="btn-hero-pill btn-pill-download"
                 onClick={() => void runDownloadNow()}
-                disabled={run?.running || current?.configured !== true}
-                aria-busy={run?.running === true}
-                title="Quét và tải đủ 10 phiên bản của từng plugin theo thứ tự từng tài khoản trong 1 phiên liên tục. Bản nào lỗi sẽ đưa vào danh sách tải sau."
-                style={{
-                  background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                  boxShadow: '0 4px 15px rgba(16, 185, 129, 0.4)',
-                }}
+                disabled={run?.running || run?.currentOperation === 'scanning' || current?.configured !== true}
+                aria-busy={run?.currentOperation === 'downloading'}
+                title={
+                  run?.currentOperation === 'scanning'
+                    ? 'Chức năng Tải tạm thời bị khóa vì đang có tiến trình Quét tài khoản'
+                    : 'Tải các phiên bản của plugin ĐÃ ĐƯỢC LIÊN KẾT tuần tự theo plugin.id (1 Browser Session, 1 Tab duy nhất)'
+                }
               >
-                {run?.running ? (
+                {run?.currentOperation === 'downloading' ? (
                   <>
-                    <RefreshCw size={18} className="spin-icon" />
+                    <RefreshCw size={16} className="spin-icon" />
                     <span>Đang chạy tải...</span>
                   </>
                 ) : (
                   <>
-                    <Download size={18} />
-                    <span>🚀 Tải Plugin Ngay (Run Download Now)</span>
+                    <Download size={16} />
+                    <span>Tải Plugin Ngay</span>
                   </>
                 )}
               </button>
 
               {/* Nút 3: Tải Tất Cả & Tự Động Gắn ID */}
               <button
-                className="btn-hero-run"
+                className="btn-hero-pill btn-pill-auto"
                 onClick={() => void runAllNow()}
-                disabled={run?.running || current?.configured !== true}
+                disabled={run?.running || run?.currentOperation === 'scanning' || current?.configured !== true}
                 aria-busy={run?.running === true}
-                title="Tự động tra cứu Spiget gắn ID cho plugin chưa có, quét toàn bộ tài khoản và tải mọi phiên bản về kho"
-                style={{
-                  background: 'rgba(255, 255, 255, 0.07)',
-                  borderColor: 'rgba(255, 255, 255, 0.15)',
-                  boxShadow: 'none',
-                }}
+                title={
+                  run?.currentOperation === 'scanning'
+                    ? 'Chức năng Tải tạm thời bị khóa vì đang có tiến trình Quét tài khoản'
+                    : 'Quy trình 3 bước: Tự động gắn ID thiếu -> Quét xác nhận quyền sở hữu -> Tải các bản của plugin đã sở hữu'
+                }
               >
-                <Zap size={16} style={{ color: '#fbbf24' }} />
-                <span style={{ fontSize: '13px' }}>Tự Động Gắn ID & Tải Hết</span>
+                <Zap size={15} />
+                <span>Tự Động Gắn ID & Tải Hết</span>
               </button>
 
-              {(run?.running || activeWorkers > 0) && (
+              {run?.running && (
                 <button
                   type="button"
                   className="btn-hero-stop"
                   onClick={() => void handleStopDownloads()}
                   disabled={stoppingDownloads}
-                  title="Dừng khẩn cấp: Ngắt mọi luồng Chrome và dừng quét/tải ngay lập tức"
+                  title="Dừng khẩn cấp: Đóng các tab trình duyệt và ngắt phiên quét/tải ngay lập tức"
                 >
-                  <Square size={16} fill="currentColor" />
-                  <span>{stoppingDownloads ? 'Đang dừng...' : '🛑 Dừng khẩn cấp'}</span>
+                  <Square size={14} fill="currentColor" />
+                  <span>{stoppingDownloads ? 'Đang dừng...' : 'Dừng khẩn cấp'}</span>
                 </button>
               )}
             </div>
@@ -624,20 +584,7 @@ export function SpigotAccountsPage() {
         </div>
       </section>
 
-      {/* 2. GIÁM SÁT TRÌNH DUYỆT SONG SONG (MULTI-WORKER MONITOR) */}
-      <InstanceMonitor
-        instances={instances}
-        concurrency={concurrency}
-        activeWorkers={activeWorkers}
-        isRunning={Boolean(run?.running)}
-        selectedWorkerId={selectedWorkerLog}
-        onConcurrencyChange={handleConcurrencyChange}
-        onSelectWorkerLog={(workerId) => {
-          setSelectedWorkerLog(workerId);
-        }}
-      />
-
-      {/* 3. CONSOLE NHẬT KÝ REAL-TIME */}
+      {/* 2. CONSOLE NHẬT KÝ REAL-TIME */}
       <section className={`panel spigot-console-section ${isExpanded ? 'is-expanded' : ''}`}>
         <div className="spigot-console-header">
           <div className="console-header-left">
@@ -653,13 +600,13 @@ export function SpigotAccountsPage() {
               <span className="console-badge idle">Sẵn sàng</span>
             )}
             <span className="console-counter-badge">{logs.length} bản ghi</span>
-            {(run?.running || activeWorkers > 0) && (
+            {run?.running && (
               <button
                 type="button"
                 className="console-emergency-stop-btn"
                 onClick={() => void handleStopDownloads()}
                 disabled={stoppingDownloads}
-                title="Dừng khẩn cấp: Ngắt mọi luồng Chrome và dừng quét/tải ngay lập tức"
+                title="Dừng khẩn cấp: Tắt Chrome và dừng quét/tải ngay lập tức"
               >
                 <Square size={11} fill="currentColor" />
                 <span>{stoppingDownloads ? 'Đang dừng...' : '🛑 Stop khẩn cấp'}</span>
@@ -737,80 +684,6 @@ export function SpigotAccountsPage() {
               <span>Xóa</span>
             </button>
           </div>
-        </div>
-
-        {/* Thanh chọn Tab lọc Log theo từng Worker riêng biệt */}
-        <div
-          className="console-worker-tabs"
-          style={{
-            display: 'flex',
-            gap: '6px',
-            padding: '8px 16px',
-            background: 'rgba(0, 0, 0, 0.3)',
-            borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-            overflowX: 'auto',
-            alignItems: 'center',
-          }}
-        >
-          <span style={{ fontSize: '11px', color: 'var(--muted)', fontWeight: 600, marginRight: '4px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-            Lọc Log Worker:
-          </span>
-          <button
-            type="button"
-            className={`console-worker-tab-btn ${selectedWorkerLog === 'all' ? 'active' : ''}`}
-            onClick={() => setSelectedWorkerLog('all')}
-            style={{
-              padding: '3px 10px',
-              borderRadius: '6px',
-              fontSize: '12px',
-              border: '1px solid',
-              borderColor: selectedWorkerLog === 'all' ? 'var(--accent)' : 'rgba(255, 255, 255, 0.1)',
-              background: selectedWorkerLog === 'all' ? 'rgba(59, 130, 246, 0.25)' : 'rgba(255, 255, 255, 0.04)',
-              color: selectedWorkerLog === 'all' ? '#93c5fd' : 'inherit',
-              cursor: 'pointer',
-              fontWeight: selectedWorkerLog === 'all' ? 600 : 400,
-            }}
-          >
-            🌐 Tất cả luồng ({logs.length})
-          </button>
-          {Array.from({ length: concurrency }, (_, idx) => idx + 1).map((workerId) => {
-            const isSelected = selectedWorkerLog === workerId;
-            const workerInstance = instances.find((w) => w.id === workerId);
-            const isBusy =
-              workerInstance &&
-              workerInstance.status !== 'idle' &&
-              workerInstance.status !== 'completed';
-            return (
-              <button
-                key={workerId}
-                type="button"
-                className={`console-worker-tab-btn ${isSelected ? 'active' : ''}`}
-                onClick={() => setSelectedWorkerLog(workerId)}
-                style={{
-                  padding: '3px 10px',
-                  borderRadius: '6px',
-                  fontSize: '12px',
-                  border: '1px solid',
-                  borderColor: isSelected ? 'var(--accent)' : 'rgba(255, 255, 255, 0.1)',
-                  background: isSelected ? 'rgba(59, 130, 246, 0.25)' : 'rgba(255, 255, 255, 0.04)',
-                  color: isSelected ? '#93c5fd' : 'inherit',
-                  cursor: 'pointer',
-                  fontWeight: isSelected ? 600 : 400,
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                }}
-              >
-                {isBusy && <span className="instance-pulse-dot" style={{ width: 6, height: 6 }} />}
-                Worker #{workerId}
-                {workerInstance?.accountLabel && (
-                  <span style={{ fontSize: '10px', opacity: 0.75 }}>
-                    (@{workerInstance.accountLabel})
-                  </span>
-                )}
-              </button>
-            );
-          })}
         </div>
 
         <div
@@ -910,15 +783,18 @@ export function SpigotAccountsPage() {
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: 6,
-                      background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(5, 150, 105, 0.3) 100%)',
-                      borderColor: 'rgba(16, 185, 129, 0.4)',
-                      color: '#6ee7b7',
-                      fontWeight: 600,
-                      padding: '6px 12px',
+                      backgroundColor: '#0284c7',
+                      borderColor: '#0284c7',
+                      color: '#ffffff',
+                      fontWeight: 650,
+                      padding: '6px 14px',
+                      borderRadius: '9999px',
+                      border: '1px solid #0284c7',
+                      cursor: 'pointer',
                     }}
                   >
                     <Zap size={14} className={autoLinking ? 'spin-icon' : ''} />
-                    <span>{autoLinking ? 'Đang tự động liên kết...' : '⚡ Tự động liên kết (Auto-Link)'}</span>
+                    <span>{autoLinking ? 'Đang tự động liên kết...' : 'Tự động liên kết (Auto-Link)'}</span>
                   </button>
                 )}
                 {current?.configured && (
@@ -1168,13 +1044,13 @@ export function SpigotAccountsPage() {
         >
           <div
             style={{
-              background: '#181a20',
-              border: '1px solid rgba(255, 255, 255, 0.15)',
-              borderRadius: 12,
+              background: 'var(--surface)',
+              border: '1px solid var(--card-border)',
+              borderRadius: 'var(--radius)',
               padding: 24,
               maxWidth: 520,
               width: '100%',
-              boxShadow: '0 20px 40px rgba(0, 0, 0, 0.6)',
+              boxShadow: 'none',
             }}
             onClick={(e) => e.stopPropagation()}
           >

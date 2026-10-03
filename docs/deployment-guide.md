@@ -312,10 +312,10 @@ sudo apt-get install -y xvfb
 wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
 
-npm ci                                  # cài cả puppeteer-real-browser đã pin trong package.json
+npm ci                                  # cài cloakbrowser và puppeteer-core
 ```
 
-Cần **cả hai**: `puppeteer-real-browser` là dependency production đã pin, nhưng nó không mang theo Chrome. Thiếu trình duyệt thì bot báo `The CHROME_PATH environment variable must be set to a Chrome/Chromium executable` — thông báo đó của thư viện bên dưới và nghe như thiếu biến môi trường, nhưng nguyên nhân thật là **máy chưa có Chrome**.
+`cloakbrowser` là dependency production đã được cài đặt và tự động tải binary Chromium Stealth với 87 bản vá C++ chống bot khi chạy lần đầu. Bạn cũng có thể cài sẵn Chrome hệ thống hoặc `xvfb` để chạy không màn hình trên Linux VPS.
 
 Đừng cài bằng `npm ci --omit=dev`: `tsx` và `typescript` là devDependency, nên bỏ dev là mất `npm run build` và toàn bộ lệnh vận hành (`deploy-commands`, `spigot-login`, `check-accounts`…).
 

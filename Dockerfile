@@ -44,31 +44,37 @@ FROM node:24-bookworm-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Chrome thật + màn hình ảo: đường tự động tải Spigot bắt buộc chạy `headless: false`
-# (chế độ headless thật bị Cloudflare nhận ra ngay), nên cần Xvfb để không ai phải
-# ngồi nhìn cửa sổ nào. Bỏ hai gói này thì bot vẫn chạy, chỉ mất tính năng tự tải.
-#
-# Đa kiến trúc (amd64 + arm64):
-#  - Trên amd64: Cài đặt Google Chrome Stable chính thức.
-#  - Trên arm64: Cài đặt Chromium qua apt (Google không phát hành .deb Chrome cho Linux ARM64).
+# CloakBrowser + Puppeteer-core: Sử dụng trình duyệt Stealth Chromium với 87 C++ patches
+# chống bot và mô phỏng thao tác người thật (Bézier mouse, cadence typing).
+# CloakBrowser tự động tải và quản lý binary stealth của nó, không cần cài chromium/google-chrome.
+# Tầng chạy chỉ cần các thư viện runtime hệ thống và Xvfb (màn hình ảo chống bị phát hiện headless).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates wget gnupg fonts-liberation xvfb procps \
-    && ARCH=$(dpkg --print-architecture) \
-    && if [ "$ARCH" = "amd64" ]; then \
-         wget -qO /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-         && apt-get install -y --no-install-recommends /tmp/chrome.deb \
-         && rm /tmp/chrome.deb; \
-       else \
-         apt-get install -y --no-install-recommends chromium; \
-       fi \
-    && if [ ! -f /usr/bin/google-chrome ] && [ -f /usr/bin/chromium ]; then \
-         ln -s /usr/bin/chromium /usr/bin/google-chrome; \
-       fi \
+        ca-certificates \
+        wget \
+        fonts-liberation \
+        xvfb \
+        procps \
+        libnss3 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libxkbcommon0 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxrandr2 \
+        libgbm1 \
+        libasound2 \
+        libpangocairo-1.0-0 \
+        libgtk-3-0 \
+        libx11-xcb1 \
+        libxcb-dri3-0 \
+        libxshmfence1 \
+        libappindicator3-1 \
+        xdg-utils \
     && rm -rf /var/lib/apt/lists/*
-
-# Đường dẫn Chrome chuẩn, đã được đảm bảo trên cả amd64 lẫn arm64.
-ENV CHROME_PATH=/usr/bin/google-chrome
 
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist

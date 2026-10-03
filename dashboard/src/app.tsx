@@ -5,6 +5,8 @@ import {
   ClipboardCheck,
   Clock,
   Crown,
+  Eye,
+  EyeOff,
   Languages,
   LayoutDashboard,
   LogOut,
@@ -428,6 +430,7 @@ function LoginScreen({ expired, onSuccess }: { expired: boolean; onSuccess: () =
   const { t, lang, setLang } = useI18n();
   const { theme, toggleTheme } = useTheme();
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -552,15 +555,28 @@ function LoginScreen({ expired, onSuccess }: { expired: boolean; onSuccess: () =
 
         <label htmlFor="dashboard-password">
           <span>{t.login.password}</span>
-          <input
-            id="dashboard-password"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoFocus
-            autoComplete="current-password"
-            aria-invalid={error !== null}
-          />
+          <div className="login-password-field">
+            <input
+              id="dashboard-password"
+              type={showPassword ? 'text' : 'password'}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoFocus
+              autoComplete="current-password"
+              aria-invalid={error !== null}
+              placeholder={lang === 'vi' ? 'Nhập mật khẩu truy cập...' : 'Enter master password...'}
+            />
+            <button
+              type="button"
+              className="login-password-toggle-btn"
+              onClick={() => setShowPassword(!showPassword)}
+              title={showPassword ? (lang === 'vi' ? 'Ẩn mật khẩu' : 'Hide password') : (lang === 'vi' ? 'Hiện mật khẩu' : 'Show password')}
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              tabIndex={-1}
+            >
+              {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+            </button>
+          </div>
         </label>
         {expired && (
           <p className="hint" style={{ marginTop: -6, marginBottom: 16 }}>

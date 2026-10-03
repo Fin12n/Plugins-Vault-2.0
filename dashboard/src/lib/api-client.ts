@@ -312,6 +312,7 @@ export type SpigotCredentialPreview = {
 
 export type SpigotRunStatus = {
   running: boolean;
+  currentOperation?: 'idle' | 'scanning' | 'downloading';
   lastStartedAt: number | null;
   lastFinishedAt: number | null;
 };

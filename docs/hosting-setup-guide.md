@@ -305,27 +305,22 @@ Cách lấy hai giá trị không có tài liệu công khai, bảng phí bạn 
 
 Mặc định tắt. Bật là chấp nhận: điều khoản SpigotMC cấm truy cập tự động, và tài khoản bị khoá chính là tài khoản đang giữ toàn bộ plugin bạn đã mua. Rủi ro và cách hệ thống tự xử lý khi bị Cloudflare chặn: [mục 9 của deployment-guide](deployment-guide.md#9-tự-động-tải-từ-spigot-không-bắt-buộc).
 
-### Cài trình duyệt
+### Cài đặt môi trường trình duyệt Stealth (CloakBrowser)
 
-Cần **hai** thứ: `xvfb` (màn hình ảo, không hiện cửa sổ nào, không cần ai bấm) và một Chrome/Chromium thật. `puppeteer-real-browser` đã nằm trong dependency nhưng **không** mang theo trình duyệt.
+Hệ thống sử dụng **CloakBrowser + Puppeteer-core** với 87 bản vá C++ chống bot và mô phỏng chuột Bézier/gõ phím người thật. CloakBrowser tự động tải và quản lý Chromium Stealth vào `~/.cloakbrowser/`, do đó **không cần cài đặt Google Chrome hay Chromium** của hệ điều hành.
 
-Trên **Ubuntu**, `apt-get install chromium` **không có gói đó** (`chromium-browser` chỉ là vỏ bọc snap, không dùng được trong service/container). Dùng `.deb` của Google:
+Chỉ cần cài đặt `xvfb` (màn hình ảo) và các thư viện runtime Linux:
 
 ```bash
-sudo apt-get install -y xvfb
-wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
-rm google-chrome-stable_current_amd64.deb
-which google-chrome-stable      # /usr/bin/google-chrome-stable
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  xvfb fonts-liberation libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+  libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+  libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libgtk-3-0 \
+  libx11-xcb1 libxcb-dri3-0 libxshmfence1 libappindicator3-1 xdg-utils
 ```
 
-Trên **Debian 12** thì `sudo apt-get install -y xvfb chromium` là đủ.
-
-**Không có sudo?** `npx puppeteer browsers install chrome` tải Chrome vào `~/.cache/puppeteer`, bot tự tìm thấy. Đừng đặt `ProtectHome=` trong unit file nếu đi đường này.
-
-Bot tự dò `/usr/bin/google-chrome-stable`, `/usr/bin/google-chrome`, `/opt/google/chrome/chrome`, `/usr/bin/chromium`, `/snap/bin/chromium`, `~/.cache/puppeteer/…`. Nằm chỗ khác thì đặt `CHROME_PATH=` trong `.env`.
-
-Thông báo `The CHROME_PATH environment variable must be set to a Chrome/Chromium executable` là của thư viện bên dưới và nghe như thiếu biến môi trường, nhưng nguyên nhân thật gần như luôn là **máy chưa có Chrome**.
+Nếu muốn chạy bằng một file nhị phân Chrome/Chromium tùy chỉnh có sẵn, bạn có thể đặt `CHROME_PATH=/đường/dẫn/tới/chrome` trong `.env`. Mặc định để trống để CloakBrowser tự tối ưu chống Cloudflare.
 
 `headless: false` là bắt buộc, không phải lựa chọn: endpoint tải của Spigot chỉ trả file khi cả trang được điều hướng tới trong trình duyệt thật. Đã đo — `curl`, `fetch`, và headless thuần đều nhận trang chặn Cloudflare kể cả khi mang cookie hợp lệ.
 
