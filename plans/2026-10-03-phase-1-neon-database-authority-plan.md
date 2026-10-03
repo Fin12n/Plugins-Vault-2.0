@@ -1,4 +1,4 @@
-# PHASE 1 FINAL IMPLEMENTATION PLAN v2 — DUAL-VAULT & BUSINESS AUTHORITY
+# PHASE 1 FINAL IMPLEMENTATION PLAN v3 — DUAL-VAULT & BUSINESS AUTHORITY
 
 > **Tôn chỉ kiến trúc tối thượng (Core Architectural Principle)**:
 > ```text
@@ -9,7 +9,7 @@
 > ```
 > - **Tuyệt đối không lưu trữ thông tin nhạy cảm** (Mật khẩu, Cookie, Session, Token định danh cá nhân upstream, Browser Profile) trên Neon Cloud PostgreSQL.
 > - **Toàn bộ dữ liệu nghiệp vụ** (Đơn hàng, Tiền tệ, Ví, Sổ cái, Thẻ cào, Webhook, Link tải, Bàn giao, Danh mục) chuyển 100% về **Neon PostgreSQL**.
-> - Không rewrite bot, không đổi UI/UX, không thêm feature mới và không sửa CloakBrowser.
+> - Không rewrite bot, không đổi UI/UX, không thêm feature mới và không can thiệp CloakBrowser.
 
 ---
 
@@ -56,10 +56,6 @@
 └────────────────────────┘  ══════════════════════════════════════════════
 ```
 
-### Nguyên tắc ranh giới an toàn (Security Boundary):
-1. **Local Secret Vault**: Tệp SQLite cục bộ (chỉ lưu trữ trên máy chủ vận hành Bot, đặt quyền `0o700`) chứa toàn bộ thông tin nhạy cảm của tài khoản Spigot và cờ crawler. Tuyệt đối không expose ra API Web Dashboard và không đồng bộ lên Neon.
-2. **Neon PostgreSQL**: Lưu trữ 100% dữ liệu nghiệp vụ. Dashboard và Bot tương tác qua Neon. Đối với Spigot Accounts, Neon chỉ lưu **Reference không nhạy cảm** (`spigot_account_refs`: `id`, `label`, `status`, `health`, `last_check_at`) phục vụ hiển thị trạng thái trên Dashboard mà không bao giờ lộ password hay cookie.
-
 ---
 
 ## 3. Data Classification Matrix
@@ -73,7 +69,7 @@
 
 ---
 
-## 4. Schema Parity
+## 4. Schema Parity & Uniqueness Invariants
 
 Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh giới phân tách:
 
@@ -81,7 +77,7 @@ Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh
 | :--- | :--- | :---: | :---: | :--- |
 | `orders` | `orders` | Business | Đã có | Chuyển timestamps sang UTC timestamp with timezone. |
 | `wallets` | `wallets` | Business | Đã có | Giữ nguyên vẹn 100%. |
-| `wallet_ledger` | `wallet_ledger` | Business | Đã có | Giữ nguyên vẹn 100%. |
+| `wallet_ledger` | `wallet_ledger` | Business | Đã có | **Bổ sung DB Uniqueness constraint: `UNIQUE (ref_type, ref_id, kind) WHERE ref_type != '' AND ref_id IS NOT NULL`** để chống nạp đúp tiền ở mức cơ sở dữ liệu. |
 | `wallet_topups` | **`wallet_topups`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (quản lý nạp tiền chuyển khoản). |
 | `sepay_transactions` | `sepay_transactions` | Business | Đã có | Bổ sung cột `description: text`. |
 | `card_topups` | `card_topups` | Business | Đã có | Giữ nguyên vẹn 100%. |
@@ -114,28 +110,17 @@ Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh
 - **Columns**: `id` (serial PK), `code` (varchar 32 unique), `discordUserId` (varchar 32 not null), `amount` (integer not null > 0), `paidAmount` (integer nullable), `status` (varchar 20 default 'pending'), `createdAt` (timestamp with tz), `expiresAt` (timestamp with tz), `creditedAt` (timestamp with tz nullable).
 - **Constraints & Indexes**: `uniqueIndex("idx_wallet_topups_code").on(table.code)`, `index("idx_wallet_topups_status").on(table.status)`, `index("idx_wallet_topups_user").on(table.discordUserId, table.createdAt)`.
 - **Lifecycle**: `pending` -> `credited` HOẶC `pending` -> `expired`.
-- **Consumers**: `open-wallet-topup.ts`, `match-and-fulfil-order.ts`, `wallet-commands.ts`, Dashboard API.
 
 ### 5.2. Bảng `discount_code_redemptions` (Business Data)
 - **Purpose**: Lưu vết và thực thi giới hạn sử dụng mã giảm giá.
 - **Columns**: `id` (serial PK), `discountId` (integer not null references `discount_codes.id` on delete cascade), `discordUserId` (varchar 32 not null), `orderId` (integer references `orders.id` on delete set null), `discountAmount` (integer > 0), `redeemedAt` (timestamp with tz default now()).
 - **Unique Constraints**: `uniqueIndex("idx_discount_redemptions_order").on(table.orderId)`.
-- **Concurrency Invariant**:
-  * Khi mã có `per_user_limit`: Kiểm tra và khóa trong transaction:
-    ```sql
-    SELECT count(*) FROM discount_code_redemptions WHERE discount_id = $1 AND discord_user_id = $2 FOR UPDATE;
-    ```
-  * Khi mã có `max_uses`: Cập nhật nguyên tử:
-    ```sql
-    UPDATE discount_codes SET used_count = used_count + 1 WHERE id = $id AND (max_uses IS NULL OR used_count < max_uses) RETURNING id;
-    ```
-- **Consumers**: `discounts.ts`, `orders.ts`, Dashboard Analytics.
+- **Indexes**: `index("idx_discount_redemptions_discount_user").on(table.discountId, table.discordUserId)`.
 
 ### 5.3. Bảng `download_tokens` (Business Data)
 - **Purpose**: Lưu mã băm SHA-256 xác thực link tải một lần qua Web endpoint `/download/:token`.
 - **Columns**: `tokenHash` (varchar 64 primary key - sha256 hex digest), `versionId` (integer not null references `versions.id` on delete cascade), `discordUserId` (varchar 32 not null), `orderId` (integer references `orders.id` on delete set null), `expiresAt` (timestamp with tz not null), `usedAt` (timestamp with tz nullable), `createdAt` (timestamp with tz default now()).
 - **Indexes**: `index("idx_download_tokens_expires").on(table.expiresAt)`, `index("idx_download_tokens_order").on(table.orderId)`.
-- **Consumers**: `mint-download-token.ts`, `server.ts` (`/download/:token`).
 
 ### 5.4. Bảng `delivery_logs` (Business Data - Tách riêng khỏi `audit_logs`)
 - **Purpose**: Nhật ký giao nhận file plugin jar của Bot Discord cho khách hàng (Customer Delivery History).
@@ -143,13 +128,11 @@ Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh
   * `delivery_logs`: Chỉ ghi nhận sự kiện phát hành file jar cho khách hàng. Không ghi trùng lặp.
 - **Columns**: `id` (serial PK), `discordUserId` (varchar 32 not null), `versionId` (integer references `versions.id` on delete set null), `orderId` (integer references `orders.id` on delete set null), `pluginName` (varchar 255 not null), `versionLabel` (varchar 64 default ''), `amount` (integer default 0), `deliveryMethod` (varchar 32: 'attachment' | 'link' | 'manual'), `ip` (varchar 45 nullable), `deliveredAt` (timestamp with tz default now()).
 - **Indexes**: `index("idx_delivery_logs_user").on(table.discordUserId)`, `index("idx_delivery_logs_delivered_at").on(table.deliveredAt)`.
-- **Consumers**: `deliver-version.ts`, `monthly-fund-stats.ts`, Dashboard Delivery View.
 
 ### 5.5. Bảng `spigot_account_refs` (Public Reference trên Neon - Không chứa Secret)
 - **Purpose**: Cung cấp danh sách tham chiếu tài khoản Spigot cho Web Dashboard giám sát trạng thái sức khỏe mà **tuyệt đối không để lộ mật khẩu hay cookie**.
 - **Columns**: `id` (serial PK), `label` (varchar 64 unique not null), `status` (varchar 20 default 'ok'), `health` (varchar 32 default 'healthy'), `lastVerifiedAt` (timestamp with tz nullable), `createdAt` (timestamp with tz default now()), `updatedAt` (timestamp with tz default now()).
 - **Loại bỏ hoàn toàn**: `password_encrypted`, `xf_user_encrypted`, `xf_session_encrypted`, `browser_profile`.
-- **Consumers**: Dashboard Spigot Management View (Read-Only Status).
 
 ---
 
@@ -157,8 +140,8 @@ Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh
 
 | Repository Gốc | Runtime Nguồn | Repository Đích | Runtime Đích | Ghi Chú Ranh Giới |
 | :--- | :---: | :--- | :---: | :--- |
-| `orders.ts` | SQLite | `neon-orders.ts` | **Neon** | Chuyển toàn bộ quản lý đơn sang Neon. |
-| `wallets.ts` | SQLite | `neon-wallets.ts` | **Neon** | Viết lại `applyLedgerEntry` có Row-Locking (`FOR UPDATE`). |
+| `orders.ts` | SQLite | `neon-orders.ts` | **Neon** | Quản lý đơn hàng trên Neon. |
+| `wallets.ts` | SQLite | `neon-wallets.ts` | **Neon** | `applyLedgerEntry` có Row-Locking (`FOR UPDATE`). |
 | `wallet-topups.ts` | SQLite | `neon-wallet-topups.ts` | **Neon** | Quản lý phiếu nạp tiền ngân hàng trên Neon. |
 | `card-topups.ts` | SQLite | `neon-card-topups.ts` | **Neon** | Quản lý nạp thẻ cào Card2k trên Neon. |
 | `discounts.ts` | SQLite | `neon-discounts.ts` | **Neon** | Thêm bảng `discount_code_redemptions`. |
@@ -169,7 +152,7 @@ Bảng đối chiếu toàn bộ các bảng dữ liệu sau khi áp dụng ranh
 | `resource-ownership.ts`| SQLite | `neon-resource-ownership.ts`| **Neon** | Ánh xạ resource_id -> account_label. |
 | `mint-download-token.ts`| SQLite | `neon-download-tokens.ts` | **Neon** | Quản lý token web tải một lần trên Neon. |
 | `deliver-version.ts` | SQLite | `neon-delivery-logs.ts` | **Neon** | Ghi nhận nhật ký bàn giao file trên Neon. |
-| `spigot-accounts.ts` | SQLite | **`spigot-accounts.ts` (Local Vault)** | **Local SQLite** | **GIỮ NGUYÊN TẠI LOCAL VAULT**. Không chuyển secret sang Neon. |
+| `spigot-accounts.ts` | SQLite | **`spigot-accounts.ts` (Local Vault)** | **Local SQLite** | **GIỮ TẠI LOCAL VAULT**. Không chuyển secret sang Neon. |
 | *(Đồng bộ Status)* | SQLite | **`neon-spigot-refs.ts`** | **Neon** | Chỉ publish `id`, `label`, `status`, `health` sang Neon. |
 | `account-scan-state.ts`| SQLite | **`account-scan-state.ts`** | **Local SQLite** | **GIỮ TẠI LOCAL VAULT**. Không đẩy crawler state lên Neon. |
 
@@ -188,81 +171,128 @@ Mọi side effect chỉ được thực thi **SAU KHI TRANSACTION COMMIT THÀNH 
 
 ---
 
-### 7.2. Đặc tả chi tiết các luồng giao dịch
+### 7.2. Đặc tả chi tiết các luồng giao dịch chuẩn hóa
 
-#### 1. Webhook SePay (Dedupe & State Mutation nguyên tử trong 1 Transaction)
-```text
-BEGIN TRANSACTION
-  1. INSERT INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, raw_payload, received_at)
-     VALUES ($1, ...) ON CONFLICT (sepay_id) DO NOTHING RETURNING id;
-  2. NẾU không có dòng trả về:
-     ROLLBACK / COMMIT EMPTY và RETURN { handled: 'duplicate' }; -- Idempotent Safe Replay
-  3. SELECT * FROM orders WHERE code = $code FOR UPDATE;
-  4. NẾU không tìm thấy order:
-     -- Kiểm tra tiếp sang wallet_topups trong cùng transaction
-     SELECT * FROM wallet_topups WHERE code = $code FOR UPDATE;
-     NẾU tìm thấy topup:
-       UPDATE wallet_topups SET status = 'credited', paid_amount = $amount, credited_at = now() WHERE id = topup.id AND status = 'pending';
-       SELECT balance FROM wallets WHERE discord_user_id = topup.discord_user_id FOR UPDATE;
-       UPDATE wallets SET balance = balance + $amount, updated_at = now() WHERE discord_user_id = topup.discord_user_id;
-       INSERT INTO wallet_ledger (discord_user_id, delta: $amount, balance_after, kind: 'bank_topup', ref_type: 'topup', ref_id: topup.id, ...);
-       COMMIT; RETURN { handled: 'topup' };
-     COMMIT; RETURN { handled: 'ignored', why: 'no-order' };
-  5. NẾU tìm thấy order:
-     UPDATE sepay_transactions SET order_id = order.id WHERE sepay_id = $sepay_id;
-     NẾU order.status != 'pending':
-       NẾU order.status IN ('wallet_paid', 'delivered'):
-         UPDATE wallets SET balance = balance + $amount WHERE discord_user_id = order.discord_user_id;
-         INSERT INTO wallet_ledger (delta: $amount, kind: 'overpay', ref_type: 'order', ref_id: order.id, ...);
-       COMMIT; RETURN { handled: 'ignored', why: 'not-pending' };
-     NẾU amount < order.bankDue:
-       UPDATE orders SET status = 'underpaid', paid_amount = $amount, paid_at = now() WHERE id = order.id;
-       COMMIT; RETURN { handled: 'ignored', why: 'underpaid' };
-     UPDATE orders SET status = 'paid', paid_amount = $amount, paid_at = now() WHERE id = order.id;
-     NẾU amount > order.bankDue (Chuyển thừa):
-       surplus = amount - order.bankDue;
-       UPDATE wallets SET balance = balance + surplus WHERE discord_user_id = order.discord_user_id;
-       INSERT INTO wallet_ledger (delta: surplus, kind: 'overpay', ref_type: 'order', ref_id: order.id, ...);
-COMMIT
+#### 1. Webhook SePay Topup Idempotency & DB Uniqueness
+```sql
+BEGIN TRANSACTION;
+  -- 1. Dedupe webhook SePay
+  INSERT INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, raw_payload, received_at)
+  VALUES ($1, ...) ON CONFLICT (sepay_id) DO NOTHING RETURNING id;
+
+  -- NẾU không có id trả về -> Webhook trùng -> COMMIT/ROLLBACK rỗng và RETURN { handled: 'duplicate' }
+
+  -- 2. Tìm topup và khóa hàng
+  SELECT * FROM wallet_topups WHERE code = $code FOR UPDATE;
+
+  -- 3. Atomic status flip: Chỉ thành công khi status đang là 'pending'
+  UPDATE wallet_topups
+  SET status = 'credited',
+      paid_amount = $amount,
+      credited_at = now()
+  WHERE id = $topupId
+    AND status = 'pending'
+  RETURNING id;
+
+  -- 4. BẮT BUỘC: Chỉ khi RETURNING trả về ĐÚNG 1 ROW mới thực thi cộng tiền ví:
+  --    Nếu trả về 0 row (đã bị credit bởi webhook khác hoặc đã expired):
+  --    -> TUYỆT ĐỐI KHÔNG CỘNG TIỀN VÀ KHÔNG GHI SỔ CÁI!
+  --    -> COMMIT và RETURN { handled: 'ignored', why: 'not-pending' }
+
+  -- 5. Lock ví và cộng tiền
+  SELECT balance FROM wallets WHERE discord_user_id = $userId FOR UPDATE;
+  INSERT INTO wallets (discord_user_id, balance, created_at, updated_at)
+  VALUES ($userId, $amount, now(), now())
+  ON CONFLICT (discord_user_id) DO UPDATE SET balance = wallets.balance + $amount, updated_at = now();
+
+  -- 6. Ghi ledger (Được bảo vệ thêm bởi UNIQUE constraint: ref_type, ref_id, kind)
+  INSERT INTO wallet_ledger (discord_user_id, delta, balance_after, kind, ref_type, ref_id, note, created_at)
+  VALUES ($userId, $amount, new_balance, 'bank_topup', 'topup', $topupId, 'nạp ví SePay', now());
+
+COMMIT;
 
 [EXTERNAL SIDE EFFECTS SAU COMMIT]
-  - Trả HTTP 200 OK cho SePay ngay lập tức.
-  - Kích hoạt bất đồng bộ deliverVersion() gửi file jar qua Discord DM.
+  - Trả HTTP 200 OK cho SePay; gửi tin nhắn Discord DM thông báo số dư mới.
 ```
 
-#### 2. Mua hàng bằng Ví (Wallet Purchase)
+#### 2. Discount Concurrency & Row-Locking Serialization
+```sql
+-- Chuẩn hóa: Bỏ SELECT COUNT(*) FOR UPDATE (không hợp lệ trong Postgres SQL).
+-- Thay bằng cơ chế Row-Locking trên parent row `discount_codes` để serialize mọi lượt redeem của cùng mã.
+BEGIN TRANSACTION;
+  -- 1. Khóa bản ghi cha của mã giảm giá
+  SELECT *
+  FROM discount_codes
+  WHERE id = $discountId
+  FOR UPDATE;
+
+  -- 2. Đếm số lần user đã sử dụng mã này
+  SELECT count(*)
+  FROM discount_code_redemptions
+  WHERE discount_id = $discountId
+    AND discord_user_id = $userId;
+
+  -- 3. Kiểm tra điều kiện hợp lệ:
+  --    - isActive == true
+  --    - expiresAt > now()
+  --    - count < per_user_limit (nếu có cấu hình)
+  --    - orderAmount >= minOrder
+  --    NẾU không thỏa mãn -> ABORT("Mã không hợp lệ hoặc vượt hạn mức cá nhân");
+
+  -- 4. Tăng used_count có kiểm tra trần max_uses
+  UPDATE discount_codes
+  SET used_count = used_count + 1
+  WHERE id = $discountId
+    AND (max_uses IS NULL OR used_count < max_uses)
+  RETURNING id;
+  -- NẾU không có row nào trả về -> ABORT("Mã giảm giá vừa hết lượt sử dụng");
+
+  -- 5. Ghi nhận redemption
+  INSERT INTO discount_code_redemptions (discount_id, discord_user_id, order_id, discount_amount, redeemed_at)
+  VALUES ($discountId, $userId, $orderId, $discountAmount, now());
+COMMIT;
+```
+
+#### 3. Purchase + Discount = ONE TRANSACTION BOUNDARY
+Discount application bắt buộc phải nằm trong cùng một transaction với purchase:
 ```text
 BEGIN TRANSACTION
-  1. SELECT balance FROM wallets WHERE discord_user_id = $userId FOR UPDATE;
-  2. walletPaid = min(balance, price); bankDue = price - walletPaid;
-  3. status = (bankDue == 0) ? 'wallet_paid' : 'pending';
-  4. INSERT INTO orders (code, discord_user_id, version_id, plugin_name, version_label, amount, wallet_paid, bank_due, status, ...)
-     VALUES (...) RETURNING *;
-  5. NẾU walletPaid > 0:
+  1. Lock discount:
+     SELECT * FROM discount_codes WHERE id = $discountId FOR UPDATE;
+  2. Validate discount (per_user_limit, max_uses, min_order, expires_at);
+  3. Tính finalPrice = max(0, orderAmount - discountAmount);
+
+  4. Lock wallet:
+     SELECT balance FROM wallets WHERE discord_user_id = $userId FOR UPDATE;
+  5. Validate balance & calculate:
+     walletPaid = min(balance, finalPrice);
+     bankDue = finalPrice - walletPaid;
+     status = (bankDue == 0) ? 'wallet_paid' : 'pending';
+
+  6. Tạo đơn hàng:
+     INSERT INTO orders (code, discord_user_id, version_id, plugin_name, amount, wallet_paid, bank_due, status, ...)
+     VALUES (...) RETURNING id, code;
+
+  7. Trừ tiền ví (nếu walletPaid > 0):
      UPDATE wallets SET balance = balance - walletPaid, updated_at = now() WHERE discord_user_id = $userId;
-     INSERT INTO wallet_ledger (discord_user_id, delta: -walletPaid, balance_after, kind: 'order_hold', ref_type: 'order', ref_id: order.id, ...);
+     INSERT INTO wallet_ledger (discord_user_id, delta: -walletPaid, kind: 'order_hold', ref_type: 'order', ref_id: order.id, ...);
+
+  8. Ghi nhận mã giảm giá & Tăng lượt sử dụng:
+     UPDATE discount_codes SET used_count = used_count + 1 WHERE id = $discountId AND (max_uses IS NULL OR used_count < max_uses) RETURNING id;
+     INSERT INTO discount_code_redemptions (discount_id, discord_user_id, order_id, discount_amount, redeemed_at)
+     VALUES ($discountId, $userId, order.id, discountAmount, now());
 COMMIT
+
+-- NẾU BẤT KỲ BƯỚC NÀO TRÊN THẤT BẠI:
+-- Toàn bộ transaction rollback sạch sẽ 100%:
+-- -> discount redemption rollback
+-- -> discount usage rollback
+-- -> wallet mutation rollback
+-- -> order rollback
 
 [EXTERNAL SIDE EFFECTS SAU COMMIT]
-  - NẾU status == 'wallet_paid': Kích hoạt deliverVersion() giao hàng tức thì.
-  - NẾU status == 'pending': Trả VietQR URL thu phần tiền còn thiếu.
-```
-
-#### 3. Cạnh tranh mã giảm giá (Discount Concurrency Control)
-```text
-BEGIN TRANSACTION
-  1. NẾU discount có per_user_limit:
-     SELECT count(*) FROM discount_code_redemptions WHERE discount_id = $dId AND discord_user_id = $uId FOR UPDATE;
-     NẾU count >= per_user_limit: ABORT("Mã đã hết lượt dùng đối với bạn");
-  2. NẾU discount có max_uses:
-     UPDATE discount_codes
-     SET used_count = used_count + 1
-     WHERE id = $dId AND (max_uses IS NULL OR used_count < max_uses)
-     RETURNING id;
-     NẾU không update được dòng nào: ABORT("Mã giảm giá vừa hết lượt sử dụng");
-  3. INSERT INTO discount_code_redemptions (discount_id, discord_user_id, order_id, discount_amount, redeemed_at)
-     VALUES ($dId, $uId, $orderId, $discountAmount, now());
-COMMIT
+  - NẾU status == 'wallet_paid': Kích hoạt bất đồng bộ deliverVersion() gửi file jar qua DM.
+  - NẾU status == 'pending': Trả VietQR URL thu phần tiền bankDue còn lại.
 ```
 
 ---
@@ -281,8 +311,6 @@ COMMIT
    - `PRAGMA integrity_check;` -> Bắt buộc trả về `ok`.
    - `PRAGMA foreign_key_check;` -> Bắt buộc trả về `[]`.
 4. **Restore Test**: Thử nghiệm mở tệp backup trên một in-memory SQLite độc lập trước khi tiến hành chuyển đổi.
-
----
 
 ### 8.2. Chiến lược phân tách dữ liệu & Xử lý xung đột (Conflict Policy)
 Chỉ chuyển đổi dữ liệu Business; giữ lại Secret Vault:
@@ -344,14 +372,20 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 
 ---
 
-## 12. Test Plan
+## 12. Test Plan (Bao gồm Acceptance Tests Mở Rộng)
 
-1. **Concurrent Purchase**: 10 request đồng thời mở đơn hàng từ cùng một user có số dư chỉ đủ mua 1 sản phẩm -> Đúng 1 đơn hàng trừ ví thành công; 9 đơn còn lại chuyển sang chờ chuyển khoản 100%. Không bao giờ âm ví.
-2. **Concurrent Topup**: 2 webhook ngân hàng gửi tiền vào cùng 1 ví tại cùng 1 thời điểm -> Cả 2 giao dịch đều ghi nhận đủ, số dư ví bằng tổng của cả 2 lần nạp, không bị Lost Update.
-3. **Purchase + Topup Concurrently**: Vừa có tiền nạp vào vừa có lệnh mua hàng trừ ví cùng lúc -> Row-locking xử lý tuần tự, số dư cuối cùng khớp tuyệt đối với ledger sum.
-4. **Discount Concurrency**: Hai purchase đồng thời cho lượt dùng mã giảm giá cuối cùng -> Đúng 1 purchase áp dụng thành công; purchase thứ hai nhận thông báo hết lượt dùng và tính đúng nguyên giá.
-5. **Duplicate Webhook**: Bắn 5 request trùng `sepay_id` đồng thời tới máy chủ -> Đúng 1 request được xử lý; 4 request còn lại nhận diện duplicate an toàn mà không ghi đúp tiền.
-6. **Process Crash Simulation**: Dừng đột ngột tiến trình Node.js giữa lúc đang thực thi webhook -> Database rollback toàn bộ; khi webhook gửi retry, hệ thống tiếp tục xử lý thành công không để lại dữ liệu rác.
+1. **Duplicate Topup Test (Acceptance)**:
+   - Giả lập 2 webhook SePay có `sepay_id` khác nhau nhưng mang cùng `wallet_topups.code` gửi tới máy chủ cùng lúc.
+   - **Kỳ vọng**: Đúng 1 giao dịch credit tiền ví thành công; đúng 1 dòng ledger được tạo; `wallet_topups.status = 'credited'`. Giao dịch thứ hai bị chặn bởi atomic status update và DB uniqueness constraint, trả về `ignored/not-pending`.
+2. **Concurrent First Redemption Test (Acceptance)**:
+   - 2 purchase đồng thời của cùng một user với cùng một discount code có cấu hình `per_user_limit = 1`.
+   - **Kỳ vọng**: Nhờ row-lock `SELECT ... FOR UPDATE` trên `discount_codes`, hai giao dịch được serialize tuần tự; đúng 1 purchase được áp dụng mã giảm giá; purchase thứ hai nhận thông báo mã đã đạt giới hạn cá nhân và tính nguyên giá.
+3. **Purchase Failure After Discount Validation Test (Acceptance)**:
+   - Mô phỏng lỗi database (ví dụ network glitch hoặc syntax error) xảy ra ngay sau bước validate discount thành công trong transaction purchase.
+   - **Kỳ vọng**: Toàn bộ transaction rollback sạch sẽ: không có discount redemption nào được ghi, `used_count` của discount không tăng, ví không bị trừ tiền, và đơn hàng không tồn tại.
+4. **Concurrent Purchase**: 10 request đồng thời mở đơn hàng từ cùng một user có số dư chỉ đủ mua 1 sản phẩm -> Đúng 1 đơn hàng trừ ví thành công; 9 đơn còn lại chuyển sang chờ chuyển khoản 100%. Không bao giờ âm ví.
+5. **Concurrent Topup**: 2 webhook ngân hàng gửi tiền vào cùng 1 ví tại cùng 1 thời điểm -> Cả 2 giao dịch đều ghi nhận đủ, số dư ví bằng tổng của cả 2 lần nạp, không bị Lost Update.
+6. **Duplicate Webhook**: Bắn 5 request trùng `sepay_id` đồng thời tới máy chủ -> Đúng 1 request được xử lý; 4 request còn lại nhận diện duplicate an toàn mà không ghi đúp tiền.
 
 ---
 
@@ -359,6 +393,7 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 
 1. [packages/db/src/schema.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/packages/db/src/schema.ts):
    - Thêm định nghĩa 4 bảng Business: `wallet_topups`, `discount_code_redemptions`, `download_tokens`, `delivery_logs`.
+   - Thêm uniqueness constraint trên `wallet_ledger`: `UNIQUE (ref_type, ref_id, kind) WHERE ref_type != '' AND ref_id IS NOT NULL`.
    - Bổ sung trường `description: text` vào bảng `sepay_transactions`.
    - Chuẩn hóa bảng `spigotAccounts` thành `spigotAccountRefs` (loại bỏ toàn bộ các cột `passwordEncrypted`, `xfUserEncrypted`, `xfSessionEncrypted`).
 2. [discord/src/index.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/index.ts):
@@ -372,6 +407,7 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
    - Bổ sung `expireStaleOrders`, `refundOrderWallet`, `listUndeliveredPaidOrders`.
 5. [discord/src/services/payment/match-and-fulfil-order.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/payment/match-and-fulfil-order.ts):
    - Gom dedupe và cập nhật trạng thái đơn/topup vào cùng 1 transaction boundary duy nhất. Cô lập hoàn toàn side effects ra ngoài transaction.
+   - Tích hợp luồng Purchase + Discount vào cùng 1 transaction boundary duy nhất.
 6. [discord/src/services/delivery/deliver-version.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/delivery/deliver-version.ts):
    - Chuyển `recordDelivery` ghi nhận vào bảng `delivery_logs` trên Neon.
 7. [discord/src/services/delivery/mint-download-token.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/delivery/mint-download-token.ts):
@@ -400,14 +436,14 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 5. [ ] **Side Effects Isolated**: Không có Discord API call, HTTP call hay File I/O nào được giữ bên trong transaction database.
 6. [ ] **Wallet Ledger Invariant Passed**: `wallets.balance == sum(wallet_ledger.delta)` đạt 100% trên toàn bộ người dùng sau di chuyển.
 7. [ ] **Duplicate Webhook Safe**: Webhook gửi lặp không bao giờ ghi đúp tiền hay làm sai trạng thái đơn.
-8. [ ] **Concurrent Mutations Safe**: Mua hàng đồng thời, nạp tiền đồng thời và cạnh tranh mã giảm giá không gây race condition.
-9. [ ] **Migration Reconciliation Passed**: Đạt missing = 0, duplicate = 0, orphan FK = 0 trên toàn bộ các khóa nghiệp vụ.
-10. [ ] **Zero Data Loss**: Toàn bộ lịch sử nạp tiền, đơn hàng và số dư của khách hàng được bảo tồn nguyên vẹn.
-11. [ ] **Existing Discord UX Unchanged**: Trải nghiệm nút bấm, modal, menu trên Bot Discord giữ nguyên 100%.
-12. [ ] **Existing Dashboard UX Unchanged**: Trải nghiệm quản trị trên Web Dashboard giữ nguyên 100%.
-13. [ ] **Existing Tests Pass**: Toàn bộ 34 test suites hiện tại vượt qua 100%.
-14. [ ] **New Integration Tests Pass**: Test suite kiểm tra tính nguyên tử và cạnh tranh trên Neon đạt 100%.
-15. [ ] **Docker Production Build Passes**: Bản build container multi-service trong `docker-compose.yml` hoạt động trơn tru.
+8. [ ] **Duplicate Topup Handled Safely**: Hai webhook khác `sepay_id` cùng `topup.code` chỉ credit ví đúng 1 lần duy nhất nhờ status guard và DB uniqueness.
+9. [ ] **Discount Concurrency Controlled**: Concurrent redemptions được serialize an toàn nhờ lock parent row `discount_codes`, tôn trọng `per_user_limit` và `max_uses`.
+10. [ ] **Purchase + Discount Unified in 1 Transaction**: Nếu purchase lỗi giữa chừng, toàn bộ discount redemption, usage count, order và wallet mutation đều rollback sạch sẽ.
+11. [ ] **Migration Reconciliation Passed**: Đạt missing = 0, duplicate = 0, orphan FK = 0 trên toàn bộ các khóa nghiệp vụ.
+12. [ ] **Zero Data Loss**: Toàn bộ lịch sử nạp tiền, đơn hàng và số dư của khách hàng được bảo tồn nguyên vẹn.
+13. [ ] **Existing UX Unchanged**: Trải nghiệm nút bấm, modal, menu trên Bot Discord và Web Dashboard giữ nguyên 100%.
+14. [ ] **Existing Tests Pass**: Toàn bộ 34 test suites hiện tại vượt qua 100%.
+15. [ ] **New Integration Tests Pass**: Test suite kiểm tra tính nguyên tử và cạnh tranh trên Neon đạt 100%.
 
 ---
 
@@ -416,9 +452,9 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 | Rủi ro kỹ thuật | Mức độ | Nguyên nhân gốc rễ | Biện pháp giảm thiểu triệt để |
 | :--- | :---: | :--- | :--- |
 | **Rò rỉ Spigot Credentials lên Cloud** | **Nghiêm trọng** | Đồng bộ toàn bộ bảng SQLite lên Neon không kiểm soát ranh giới. | **Dual-Vault Boundary**: Giữ credentials tại Local SQLite; Neon chỉ lưu `spigot_account_refs` phi nhạy cảm. |
-| **Race condition khi trừ số dư ví** | **Nghiêm trọng** | Môi trường web đa kết nối đồng thời dễ đọc cùng số dư cũ. | Bắt buộc sử dụng `SELECT ... FOR UPDATE` trong transaction của Neon. |
+| **Topup nạp đúp tiền ví** | **Nghiêm trọng** | Hai webhook khác `sepay_id` đến cùng lúc cho cùng 1 mã nạp. | Atomic status update `WHERE status = 'pending' RETURNING id` kết hợp `UNIQUE (ref_type, ref_id, kind)` trên `wallet_ledger`. |
+| **Lệch hạn mức mã giảm giá** | **Cao** | Hai purchase đồng thời cùng tranh chấp lượt mã cuối cùng. | Khóa hàng cha `SELECT * FROM discount_codes WHERE id = $id FOR UPDATE` để serialize và gom vào 1 transaction duy nhất với purchase. |
 | **Mất giao dịch khi Rollback sai cách** | **Nghiêm trọng** | Khôi phục database bằng cách ghi đè backup SQLite cũ sau cutover. | **Cấm Rollback ghi đè DB**: Chỉ Rollback Application code; nếu lỗi DB thì dùng Neon PITR. |
-| **Cạnh tranh mã giảm giá vượt hạn mức** | **Trung bình** | Hai purchase đồng thời cùng đọc `used_count` cũ. | Atomic update `used_count = used_count + 1 WHERE used_count < max_uses` trong transaction. |
 
 ---
 

@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v2: Dual-Vault & Business Authority)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v3: Topup Idempotency & Unified Transaction)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,24 +172,23 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Cuối Cùng (Final Architecture Corrections):
-1. **Ranh Giới Bảo Mật Tuyệt Đối (Secret Vault Isolation)**:
-   - **Local SQLite (`data/vault_secrets.db`)**: Lưu trữ cục bộ toàn bộ thông tin nhạy cảm của Spigot (`username`, `password_encrypted`, `cookies`, `session`, `browser_profile`) và cờ thu thập `account_scan_state`. **Tuyệt đối không lưu mật khẩu hay cookie trên Neon Cloud Database!**
-   - **Neon PostgreSQL**: Chỉ lưu trữ dữ liệu nghiệp vụ và các tham chiếu tài khoản công khai (`spigot_account_refs`: `id`, `label`, `status`, `health`) để Dashboard hiển thị trạng thái mà không bao giờ lộ credentials.
-2. **Tính Nguyên Tử Cho Webhook SePay (Transaction Atomicity & Idempotency)**:
-   - Gom toàn bộ thao tác: Ghi nhận giao dịch SePay (`ON CONFLICT DO NOTHING RETURNING id`), Khóa hàng `SELECT ... FOR UPDATE`, Cập nhật đơn/topup, và Ghi sổ cái số dư ví vào **CÙNG MỘT TRANSACTION BOUNDARY**.
-   - Nếu sập nguồn trước khi `COMMIT`, toàn bộ rollback sạch sẽ; webhook gửi retry sẽ được xử lý lại nguyên tử.
-3. **Cô Lập Tuyệt Đối Side Effects Ra Ngoài Transaction**:
-   - Cấm giữ transaction mở trong khi: gửi tin nhắn Discord DM, gọi API Card2k/Spigot, chạy CloakBrowser, hoặc đọc/ghi file jar trên ổ đĩa. Side effects chỉ chạy sau khi transaction đã `COMMIT` thành công.
-4. **Bất Biến Số Dư Ví (Wallet Invariant)**:
-   - Đảm bảo bất biến tuyệt đối: `wallets.balance == SUM(wallet_ledger.delta)` cho 100% người dùng.
-   - Sử dụng `SELECT ... FOR UPDATE` trong transaction Neon để chống race condition khi mở đơn hoặc nạp tiền đồng thời.
-5. **Cạnh Tranh Mã Giảm Giá (Discount Concurrency)**:
-   - Atomic claim cho `max_uses` bằng `UPDATE discount_codes SET used_count = used_count + 1 WHERE id = $id AND used_count < max_uses RETURNING id`.
-   - Kiểm soát `per_user_limit` bằng row-locking trên `discount_code_redemptions`.
-6. **Chiến Lược Rollback Chuẩn Xác**:
-   - Bỏ quy trình rollback ghi đè Neon bằng backup SQLite cũ (vì gây mất mát các đơn hàng và giao dịch mới sau cutover).
-   - Rollback đúng: Application Rollback (revert code, vẫn giữ Neon DB) hoặc Neon Point-In-Time Recovery (PITR) nếu lỗi schema/migration.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Cuối Cùng (Final Architecture Corrections v3):
+1. **Wallet Topup Idempotency & DB Uniqueness**:
+   - Webhook SePay chỉ được cộng tiền ví và ghi ledger khi câu lệnh `UPDATE wallet_topups SET status = 'credited' ... WHERE status = 'pending' RETURNING id` trả về **ĐÚNG 1 DÒNG**.
+   - Bổ sung ràng buộc cơ sở dữ liệu `UNIQUE (ref_type, ref_id, kind)` trên `wallet_ledger` ngăn chặn hoàn toàn nguy cơ nạp đúp tiền ở tầng database.
+2. **Discount Concurrency qua Khóa Hàng Cha (Parent Row-Locking)**:
+   - Loại bỏ `SELECT COUNT(*) FOR UPDATE` không hợp lệ.
+   - Sử dụng `SELECT * FROM discount_codes WHERE id = $id FOR UPDATE` để serialize tuần tự mọi lượt áp dụng mã giảm giá, kiểm soát chính xác `per_user_limit` và `max_uses`.
+3. **Purchase + Discount = ONE TRANSACTION BOUNDARY**:
+   - Toàn bộ thao tác: Lock mã giảm giá, tính giá cuối, lock ví, tạo đơn hàng, trừ tiền ví, ghi nhận mã giảm giá và tăng `used_count` đều nằm trong **CÙNG MỘT TRANSACTION DUY NHẤT**. Nếu đơn hàng lỗi, toàn bộ mã giảm giá và số dư ví tự động rollback sạch sẽ.
+4. **Bổ Sung 3 Acceptance Test Cases**:
+   - Duplicate Topup (2 webhook khác `sepay_id` cùng `topup.code`).
+   - Concurrent First Redemption (2 purchase đồng thời cùng user cho mã `per_user_limit = 1`).
+   - Purchase Failure After Discount Validation (Simulate DB failure -> Rollback toàn diện).
+5. **Ranh Giới Bảo Mật Tuyệt Đối (Secret Vault Isolation)**:
+   - Toàn bộ mật khẩu, cookie, session Spigot giữ tại Local SQLite (`data/vault_secrets.db`). Neon chỉ lưu tham chiếu phi nhạy cảm `spigot_account_refs`.
+6. **Chiến Lược Rollback Không Mất Dữ Liệu**:
+   - Cấm rollback bằng cách ghi đè DB từ backup SQLite cũ. Áp dụng Application Rollback (cùng Neon DB) hoặc Neon PITR.
 7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
