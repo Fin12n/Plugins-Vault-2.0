@@ -142,4 +142,23 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
+## 6. Triển Khai & Đồng Bộ Lên GitHub (Workflow /deploy)
+
+- **Target Repository**: [https://github.com/Fin12n/Plugins-Vault-2.0.git](https://github.com/Fin12n/Plugins-Vault-2.0.git)
+- **Branch**: `main`
+- **Thời điểm**: 03/10/2026
+
+### Các Biện Pháp Bảo Mật & Tiền Kiểm (Pre-Flight Checks):
+1. **Kiểm Soát Rò Rỉ Bí Mật (Zero Secret Leak)**:
+   - Cấu hình `.gitignore` chặn toàn bộ file môi trường (`.env*`), tệp dữ liệu SQLite (`data/*.db`, `*.sqlite`), thư mục chứa jar tải về (`vault/`, `storage/`, `tmp/`), các file nén (`*.zip`, `*.tar.gz`), và ảnh chụp test.
+   - Quét và loại bỏ key bản quyền CloakBrowser hardcoded, chuyển sang sử dụng biến môi trường chuẩn `CLOAK_LICENSE_KEY`.
+2. **Kiểm Định Tính Toàn Vẹn Mã Nguồn**:
+   - `tsc --noEmit`: Đạt 100% không lỗi trên cả 3 workspace (`packages/db`, `discord`, `dashboard`).
+   - Vitest: **34/34 test suites PASS** (806/806 tests).
+3. **Kết Quả Triển Khai**:
+   - Khởi tạo và thiết lập remote `origin` sang `https://github.com/Fin12n/Plugins-Vault-2.0.git`.
+   - Push thành công toàn bộ mã nguồn Monorepo sạch sẽ lên nhánh `main`.
+
+---
+
 > 📝 **Cam kết thực thi**: Báo cáo Walkthrough này sẽ tiếp tục được tự động cập nhật và xuất bản sau mỗi giai đoạn triển khai PLAN tiếp theo của dự án.
