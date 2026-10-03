@@ -1,4 +1,4 @@
-# PHASE 1 FINAL IMPLEMENTATION PLAN v6 — DUAL-VAULT & BUSINESS AUTHORITY
+# PHASE 1 FINAL IMPLEMENTATION PLAN v7 — DUAL-VAULT & BUSINESS AUTHORITY
 
 > **Tôn chỉ kiến trúc tối thượng (Core Architectural Principle)**:
 > ```text
@@ -45,16 +45,18 @@
 ├────────────────────────┤  ══════════════════════════════════════════════
 │ • spigot_accounts      │  • users / staffs         • wallet_ledger
 │   - account_id (UUID)  │  • plugins / versions     • wallet_topups
-│   - label              │  • manual_uploads         • card_topups
-│   - enc_password       │  • orders                 • discount_codes
-│   - enc_cookies (xf)   │  • sepay_transactions     • discount_redemptions
-│   - session / profile  │    (relational trace)     • delivery_logs
-│ • account_scan_state   │  • wallets                • delivery_jobs
-│   - rate-limit state   │  • download_tokens        • upstream_state
-│   - crawl errors       │  • resource_ownership    • pending_download
-│ • vault/ storage blobs │  • discord_channels       • audit_logs (Staff)
-│   - JAR files on disk  │  • spigot_account_refs (account_id UUID, label, health)
-│ • Ciphertext only      │  • migration_checkpoints (Resumable progress)
+│   - label              │    (Natural Key:          • card_topups
+│   - enc_password       │     plugin_id + version)  • discount_codes
+│   - enc_cookies (xf)   │  • manual_uploads         • discount_redemptions
+│   - session / profile  │  • orders                 • delivery_logs
+│ • account_scan_state   │  • sepay_transactions     • delivery_jobs
+│   - rate-limit state   │    (relational trace)       (lease & recovery)
+│   - crawl errors       │  • wallets                • upstream_state
+│ • vault/ storage blobs │  • download_tokens        • pending_download
+│   - JAR files on disk  │    (atomic claim/unclaim) • audit_logs (Staff)
+│ • Ciphertext only      │  • resource_ownership    • migration_checkpoints
+│                        │  • discord_channels         (atomic batch)
+│                        │  • spigot_account_refs (account_id UUID, label)
 └────────────────────────┘  ══════════════════════════════════════════════
   ▲
   │ (Key injected from outside DB: VAULT_MASTER_KEY)
@@ -87,13 +89,13 @@
 | `card_topups` | `card_topups` | Business | Đã có | Giữ nguyên vẹn 100%. |
 | `plugins` | `plugins` | Business | Đã có | Gộp `plugin_aliases` thành mảng string `aliases`. |
 | `plugin_aliases` | *(Trong `plugins.aliases`)* | Business | Đã gom | Migrate dữ liệu vào mảng text trên Neon. |
-| `versions` | `versions` | Business | Đã có | Giữ nguyên, thêm `changeLogs`, `source`. |
+| `versions` | `versions` | Business | ❌ **Chuẩn hóa** | **Natural Key: `(plugin_id, version)`**. Thêm `UNIQUE (plugin_id, version)`. SHA256 chỉ dùng để audit/integrity. |
 | `manual_uploads` | `manual_uploads` | Business | Đã có | Giữ nguyên vẹn. |
 | `discount_codes` | `discount_codes` | Business | Đã có | Giữ nguyên vẹn. |
 | `discount_code_redemptions` | **`discount_code_redemptions`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (chống gian lận mã giảm giá). |
-| `download_tokens` | **`download_tokens`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (quản lý link tải web với atomic consumption). |
+| `download_tokens` | **`download_tokens`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (atomic claim/unclaim & compensation). |
 | `audit_log` (Bot) | **`delivery_logs`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (có `delivery_idempotency_key`, phân biệt `requested_method` vs `actual_method`). |
-| *(Durable Handoff)* | **`delivery_jobs`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** với **Unique constraint `(order_id, requested_method)`**. |
+| *(Durable Handoff)* | **`delivery_jobs`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** với **Unique `(order_id, requested_method)`**, lease timeout & stale recovery. |
 | `upstream_state` | `upstream_state` | Business | Đã có | Giữ nguyên vẹn. |
 | `pending_download` | `pending_download` | Business | Đã có | Giữ nguyên vẹn. |
 | `pending_ingest` | `pending_ingest` | Business | Đã có | Giữ nguyên vẹn. |
@@ -102,7 +104,7 @@
 | `dashboard_staff` | `staffs` | Business | Đã có | Map dữ liệu sang bảng staffs RBAC. |
 | `audit_log` (Admin) | `audit_logs` | Business | Đã có | Giữ nguyên cho Staff RBAC actions. |
 | `config` | `config` | Business | Đã có | Giữ nguyên cấu hình runtime. |
-| *(Resumable Migration)* | **`migration_checkpoints`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (lưu vết checkpoint tiến trình di chuyển dữ liệu). |
+| *(Resumable Migration)* | **`migration_checkpoints`** | Business | ❌ **Cần thêm** | **Tạo mới trên Neon** (quản lý batch checkpoint atomic). |
 | `spigot_accounts` (Secret) | *(Không đưa lên Neon)* | **Secret** | **Local Only** | **GIỮ TẠI LOCAL SQLITE** (Bổ sung `account_id` UUID). |
 | *(Identity Bridge)* | **`spigot_account_refs`** | Reference | ❌ **Chuẩn hóa** | Thay thế `spigotAccounts` cũ trên Neon: Khóa chính `account_id` UUID, loại bỏ mật khẩu. |
 | `account_scan_state` | *(Không đưa lên Neon)* | **Secret** | **Local Only** | **GIỮ TẠI LOCAL SQLITE**. |
@@ -122,7 +124,20 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
   .on(table.refType, table.refId, table.kind)
   .where(sql`ref_type != '' AND ref_id IS NOT NULL`);
 ```
-*Tác dụng*: Ngăn chặn hoàn toàn việc credit đúp cùng một nghiệp vụ (`topup`, `order_refund`, `card_topup`) vào cùng một loại ledger ở tầng database, trong khi vẫn cho phép các dòng ledger không có ref (như manual adjustment) được ghi nhận an toàn.
+
+### 4.3. Version Business Identity & Natural Key
+Business identity của một plugin version được xác định duy nhất bởi:
+$$\text{Version Business Identity} = \text{plugin\_id} + \text{version string}$$
+
+```sql
+CREATE UNIQUE INDEX idx_versions_plugin_version
+ON versions (plugin_id, version);
+```
+Trong Drizzle ORM:
+```typescript
+uniqueIndex("idx_versions_plugin_version").on(table.pluginId, table.version);
+```
+- **Vai trò của SHA256**: Cột `sha256` trong bảng `versions` **chỉ được sử dụng để verify tính toàn vẹn của tệp JAR (file integrity), phát hiện tệp bị lỗi (corrupted file), đối soát kiểm toán (file content audit) và phát hiện thay đổi artifact**. SHA256 **KHÔNG PHẢI** là business natural key duy nhất của entity version.
 
 ---
 
@@ -133,7 +148,6 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
 - **Columns**: `id` (serial PK), `code` (varchar 32 unique), `discordUserId` (varchar 32 not null), `amount` (integer not null > 0), `paidAmount` (integer nullable), `status` (varchar 20 default 'pending'), `createdAt` (timestamp with tz), `expiresAt` (timestamp with tz), `creditedAt` (timestamp with tz nullable).
 - **Constraints & Indexes**: `uniqueIndex("idx_wallet_topups_code").on(table.code)`, `index("idx_wallet_topups_status").on(table.status)`, `index("idx_wallet_topups_user").on(table.discordUserId, table.createdAt)`.
 - **Thống nhất Lifecycle với Payment Matrix**:
-  Trạng thái `expired` **KHÔNG PHẢI LÀ TERMINAL STATE**. Nếu tiền khách chuyển đến muộn sau khi hết hạn, hệ thống tự động đối soát và chuyển trạng thái hợp lệ sang `credited`:
   ```text
   pending ───(quá hạn expiresAt)───▶ expired
      │                                  │
@@ -142,7 +156,6 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
   ```
 
 ### 5.2. Bảng `sepay_transactions` (Traceability & Explicit States)
-- **Purpose**: Lưu vết toàn bộ giao dịch ngân hàng và liên kết quan hệ trực tiếp tới đơn hàng hoặc phiếu nạp ví (Full Payment Traceability).
 - **Columns**:
   - `id` (serial PK)
   - `sepayId` (varchar 64 unique not null)
@@ -158,37 +171,57 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
   - `rawPayload` (jsonb not null)
   - `receivedAt` (timestamp with tz default now())
 - **Explicit Status Enum/States**:
-  - `'received'`: Webhook đã tiếp nhận vào database, chờ xử lý nghiệp vụ.
-  - `'matched'`: Đã khớp mã giao dịch với đơn hàng hoặc phiếu nạp hợp lệ.
-  - `'credited'`: Đã hoàn tất cộng tiền ví hoặc kích hoạt đơn hàng thành công.
-  - `'underpaid'`: Chuyển thiếu tiền; đã xử lý cộng tiền thực nhận vào ví người dùng.
-  - `'overpaid'`: Chuyển thừa tiền; đã xử lý giao đơn và hoàn tiền thừa vào ví.
-  - `'duplicate_transfer'`: Chuyển khoản lặp lại cho mã nạp đã được credit trước đó (không cộng đúp).
-  - `'unmatched'`: Mã nội dung chuyển khoản không tìm thấy trong hệ thống, chuyển cảnh báo Staff đối soát.
+  `'received'`, `'matched'`, `'credited'`, `'underpaid'`, `'overpaid'`, `'duplicate_transfer'`, `'unmatched'`.
 
 ### 5.3. Bảng `discount_code_redemptions` (Business Data)
-- **Purpose**: Lưu vết và thực thi giới hạn sử dụng mã giảm giá.
 - **Columns**: `id` (serial PK), `discountId` (integer not null references `discount_codes.id` on delete cascade), `discordUserId` (varchar 32 not null), `orderId` (integer references `orders.id` on delete set null), `discountAmount` (integer > 0), `redeemedAt` (timestamp with tz default now()).
 - **Unique Constraints**: `uniqueIndex("idx_discount_redemptions_order").on(table.orderId)`.
 - **Indexes**: `index("idx_discount_redemptions_discount_user").on(table.discountId, table.discordUserId)`.
 
-### 5.4. Bảng `download_tokens` (Business Data - Atomic Consumption)
-- **Purpose**: Lưu mã băm SHA-256 xác thực link tải một lần qua Web endpoint `/download/:token`.
-- **Columns**: `tokenHash` (varchar 64 primary key - sha256 hex digest), `versionId` (integer not null references `versions.id` on delete cascade), `discordUserId` (varchar 32 not null), `orderId` (integer references `orders.id` on delete set null), `expiresAt` (timestamp with tz not null), `usedAt` (timestamp with tz nullable), `createdAt` (timestamp with tz default now()).
-- **Indexes**: `index("idx_download_tokens_expires").on(table.expiresAt)`, `index("idx_download_tokens_order").on(table.orderId)`.
-- **Atomic Consumption Invariant**: Cấm đọc rồi ghi (no read-then-write). Tiêu thụ token bằng atomic mutation:
-  ```sql
-  UPDATE download_tokens
-  SET used_at = now()
-  WHERE token_hash = $hash
-    AND used_at IS NULL
-    AND expires_at > now()
-  RETURNING version_id, discord_user_id, order_id;
+### 5.4. Bảng `download_tokens` (Authorization & Failure Recovery Policy)
+- **Columns**:
+  - `tokenHash` (varchar 64 primary key - sha256 hex digest)
+  - `versionId` (integer not null references `versions.id` on delete cascade)
+  - `discordUserId` (varchar 32 not null)
+  - `orderId` (integer references `orders.id` on delete set null)
+  - `expiresAt` (timestamp with tz not null)
+  - `usedAt` (timestamp with tz nullable)
+  - `failureReason` (text nullable)
+  - `createdAt` (timestamp with tz default now())
+- **Thứ tự xử lý bắt buộc tại Endpoint `/download/:token`**:
+  ```text
+  1. Validate token format (hex sha256)
+  2. Validate expiry (expires_at > now())
+  3. Validate unused (used_at IS NULL)
+  4. Validate referenced order / user / version
+  5. Atomically claim token:
+     UPDATE download_tokens
+     SET used_at = now()
+     WHERE token_hash = $hash
+       AND used_at IS NULL
+       AND expires_at > now()
+     RETURNING token_hash, version_id, discord_user_id, order_id;
+  6. Verify file exists on local storage (fs.existsSync(jarPath))
+  7. Stream file (Content-Disposition, Content-Type, Content-Length)
   ```
-  Chỉ request nhận được row trả về mới được phép tải file.
+- **Xử lý Failure & Compensation Policy**:
+  - *Token hợp lệ nhưng File missing / Storage unavailable trước khi stream*:
+    - **Không trừ lượt token của khách**.
+    - Thực thi bồi hoàn giải phóng token (atomic unclaim):
+      ```sql
+      UPDATE download_tokens
+      SET used_at = NULL, failure_reason = 'file_missing_on_storage'
+      WHERE token_hash = $hash;
+      ```
+    - Trả HTTP 503 Service Unavailable ("Tệp tải đang tạm thời bảo trì, token của bạn đã được bảo lưu. Vui lòng thử lại sau ít phút.").
+    - Bắn alert khẩn lên kênh Staff Discord để admin kiểm tra tệp JAR trên đĩa.
+  - *Stream fail giữa chừng (Client ngắt mạng / timeout)*:
+    - Hỗ trợ HTTP Range requests (`Accept-Ranges: bytes`) cho phép tiếp tục tải phân đoạn.
+    - Nếu lỗi không thể khôi phục: Token đã claim. Khách có thể bấm nút "Lấy lại link tải" trên Bot Discord để cấp token mới nếu đơn hàng đã được đánh dấu `paid`.
+  - *Concurrent requests dùng cùng token*:
+    - Atomic mutation đảm bảo **chính xác 1 request nhận được row từ `RETURNING`** và tải file thành công. Mọi request khác nhận 0 row -> Bị từ chối ngay lập tức (HTTP 410 Gone / 403 Forbidden).
 
-### 5.5. Bảng `delivery_jobs` (Durable Delivery Intent with Uniqueness)
-- **Purpose**: Quản lý ý định giao hàng bền vững (Durable Delivery Intent).
+### 5.5. Bảng `delivery_jobs` (Durable Intent, Lease Duration & Stale Recovery)
 - **Columns**:
   - `id` (serial PK)
   - `orderId` (integer not null references `orders.id` on delete cascade)
@@ -198,8 +231,9 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
   - `status` (varchar 20 default 'queued': 'queued' | 'processing' | 'delivered' | 'failed')
   - `externalAttemptCount` (integer not null default 0)
   - `claimToken` (varchar 64 nullable)
-  - `lastError` (text nullable)
   - `lockedAt` (timestamp with tz nullable)
+  - `retryCount` (integer default 0)
+  - `lastError` (text nullable)
   - `createdAt` (timestamp with tz default now())
   - `updatedAt` (timestamp with tz default now())
 - **Delivery Job Uniqueness Invariant**:
@@ -207,53 +241,48 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
   CREATE UNIQUE INDEX idx_delivery_jobs_order_method_unique
   ON delivery_jobs (order_id, requested_method);
   ```
-  *Nguyên tắc*: **1 Order + 1 Delivery Method = Đúng 1 Active Delivery Intent**. Retries tái sử dụng cùng 1 row.
+- **Lease Timeout & Stale Recovery Policy**:
+  - `DELIVERY_JOB_LEASE = 300 seconds (5 phút)`.
+  - *Claim Rule (Atomic lock acquisition)*:
+    ```sql
+    UPDATE delivery_jobs
+    SET status = 'processing',
+        claim_token = $claimUuid,
+        locked_at = now(),
+        external_attempt_count = external_attempt_count + 1,
+        updated_at = now()
+    WHERE id = (
+      SELECT id FROM delivery_jobs
+      WHERE status = 'queued'
+         OR (status = 'processing' AND locked_at < now() - INTERVAL '5 minutes')
+      ORDER BY created_at ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    RETURNING id, order_id, discord_user_id, version_id, requested_method, claim_token, external_attempt_count, retry_count;
+    ```
+  - *Retryable Failure*: Nếu gặp lỗi tạm thời (Discord 429 rate limit, network timeout) và `retryCount < 3`:
+    ```sql
+    UPDATE delivery_jobs
+    SET status = 'queued', claim_token = NULL, locked_at = NULL, retry_count = retry_count + 1, last_error = $err, updated_at = now()
+    WHERE id = $jobId AND claim_token = $claimUuid;
+    ```
+  - *Permanent Failure*: Nếu khách khóa DM (Error 50007 Cannot send messages to this user) hoặc `retryCount >= 3`:
+    ```sql
+    UPDATE delivery_jobs
+    SET status = 'failed', claim_token = NULL, last_error = $err, updated_at = now()
+    WHERE id = $jobId AND claim_token = $claimUuid;
+    ```
+    Hệ thống ghi log cảnh báo và tự động chuyển sang cấp download link cho khách qua kênh hỗ trợ.
 
 ### 5.6. Bảng `delivery_logs` (Business Audit Trail - Intent vs Outcome)
-- **Purpose**: Lưu vết lịch sử phát hành file plugin jar cho khách hàng (Customer Delivery History).
-- **Columns**:
-  - `id` (serial PK)
-  - `deliveryIdempotencyKey` (varchar 128 not null)
-  - `discordUserId` (varchar 32 not null)
-  - `versionId` (integer references `versions.id` on delete set null)
-  - `orderId` (integer references `orders.id` on delete set null)
-  - `pluginName` (varchar 255 not null)
-  - `versionLabel` (varchar 64 default '')
-  - `amount` (integer default 0)
-  - `requestedMethod` (varchar 32 not null: 'attachment' | 'link' | 'manual')
-  - `actualMethod` (varchar 32 not null: 'attachment' | 'fallback_link' | 'manual')
-  - `ip` (varchar 45 nullable)
-  - `deliveredAt` (timestamp with tz default now())
-- **Idempotency Constraint**:
-  ```sql
-  CREATE UNIQUE INDEX idx_delivery_logs_idempotency_key
-  ON delivery_logs (delivery_idempotency_key);
-  ```
-  *Quy chuẩn Outcome*: Nếu gửi attachment thất bại hoặc crash recovery kích hoạt cấp link, ghi rõ `requestedMethod = 'attachment'`, `actualMethod = 'fallback_link'`. Không bao giờ ghi fallback link dưới danh nghĩa attachment.
+- **Columns**: `id`, `deliveryIdempotencyKey` (unique), `discordUserId`, `versionId`, `orderId`, `pluginName`, `versionLabel`, `amount`, `requestedMethod` ('attachment' | 'link' | 'manual'), `actualMethod` ('attachment' | 'fallback_link' | 'manual'), `ip`, `deliveredAt`.
 
 ### 5.7. Bảng `spigot_account_refs` (Stable UUID Identity Bridge)
-- **Purpose**: Tham chiếu tài khoản Spigot giữa Local Vault và Neon Dashboard qua UUID bất biến, **không dùng `label` làm định danh khóa chính**.
-- **Columns**:
-  - `accountId` (uuid primary key not null)
-  - `label` (varchar 64 not null)
-  - `status` (varchar 20 default 'ok')
-  - `health` (varchar 32 default 'healthy')
-  - `lastVerifiedAt` (timestamp with tz nullable)
-  - `createdAt` (timestamp with tz default now())
-  - `updatedAt` (timestamp with tz default now())
-- **Identity Invariant**: Thay đổi `label` trên Dashboard hoặc Local không làm thay đổi hay đứt gãy liên kết `accountId`.
-- **Bảo mật tuyệt đối**: Không chứa mật khẩu, cookie hay session.
+- **Columns**: `accountId` (uuid primary key not null), `label` (varchar 64 not null), `status`, `health`, `lastVerifiedAt`, `createdAt`, `updatedAt`.
 
-### 5.8. Bảng `migration_checkpoints` (Resumable Migration Progress)
-- **Purpose**: Ghi nhận tiến trình di chuyển dữ liệu theo từng checkpoint để hỗ trợ resume an toàn khi gặp sự cố crash hoặc timeout.
-- **Columns**:
-  - `stepName` (varchar 64 primary key)
-  - `status` (varchar 20 not null default 'in_progress': 'in_progress' | 'completed' | 'failed')
-  - `lastProcessedKey` (varchar 128 nullable)
-  - `processedCount` (integer default 0)
-  - `checksum` (varchar 64 nullable)
-  - `startedAt` (timestamp with tz default now())
-  - `completedAt` (timestamp with tz nullable)
+### 5.8. Bảng `migration_checkpoints` (Atomic Batch Checkpoints)
+- **Columns**: `stepName` (varchar 64 primary key), `status` ('in_progress' | 'completed' | 'failed'), `lastProcessedKey`, `processedCount`, `checksum`, `startedAt`, `completedAt`.
 
 ---
 
@@ -263,17 +292,17 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
 | :--- | :---: | :--- | :---: | :--- |
 | `orders.ts` | SQLite | `neon-orders.ts` | **Neon** | Quản lý đơn hàng trên Neon. |
 | `wallets.ts` | SQLite | `neon-wallets.ts` | **Neon** | `applyLedgerEntry` có Row-Locking (`FOR UPDATE`). |
-| `wallet-topups.ts` | SQLite | `neon-wallet-topups.ts` | **Neon** | Quản lý phiếu nạp tiền ngân hàng trên Neon (vòng đời `expired -> credited`). |
+| `wallet-topups.ts` | SQLite | `neon-wallet-topups.ts` | **Neon** | Quản lý phiếu nạp tiền (vòng đời `expired -> credited`). |
 | `card-topups.ts` | SQLite | `neon-card-topups.ts` | **Neon** | Quản lý nạp thẻ cào Card2k trên Neon. |
 | `discounts.ts` | SQLite | `neon-discounts.ts` | **Neon** | Thêm bảng `discount_code_redemptions`. |
 | `plugins.ts` | SQLite | `neon-plugins.ts` | **Neon** | Chuyển catalog plugin sang Neon. |
-| `versions.ts` | SQLite | `neon-versions.ts` | **Neon** | Chuyển catalog phiên bản sang Neon. |
+| `versions.ts` | SQLite | `neon-versions.ts` | **Neon** | Natural Key: `(plugin_id, version)`. |
 | `upstream-state.ts` | SQLite | `neon-upstream.ts` | **Neon** | Quản lý version upstream trên Neon. |
 | `pending-download.ts` | SQLite | `neon-upstream.ts` | **Neon** | Hàng đợi tải upstream trên Neon. |
 | `resource-ownership.ts`| SQLite | `neon-resource-ownership.ts`| **Neon** | Ánh xạ resource_id -> `account_id` UUID. |
-| `mint-download-token.ts`| SQLite | `neon-download-tokens.ts` | **Neon** | Quản lý token web tải một lần trên Neon (Atomic mutation). |
+| `mint-download-token.ts`| SQLite | `neon-download-tokens.ts` | **Neon** | Quản lý token web tải một lần kèm atomic unclaim compensation. |
 | `deliver-version.ts` | SQLite | `neon-delivery-logs.ts` | **Neon** | Ghi nhận nhật ký bàn giao file (`requested` vs `actual`). |
-| *(Durable Handoff)* | In-Memory | `neon-delivery-jobs.ts` | **Neon** | Quản lý hàng đợi job có Unique `(order_id, requested_method)`. |
+| *(Durable Handoff)* | In-Memory | `neon-delivery-jobs.ts` | **Neon** | Quản lý hàng đợi job có Unique `(order_id, requested_method)` và Lease Recovery. |
 | `spigot-accounts.ts` | SQLite | **`spigot-accounts.ts` (Local Vault)** | **Local SQLite** | **GIỮ TẠI LOCAL VAULT** (Có `account_id` UUID). |
 | *(Đồng bộ Status)* | SQLite | **`neon-spigot-refs.ts`** | **Neon** | Publish `account_id` UUID, `label`, `status`, `health` sang Neon. |
 | `account-scan-state.ts`| SQLite | **`account-scan-state.ts`** | **Local SQLite** | **GIỮ TẠI LOCAL VAULT**. Không đẩy crawler state lên Neon. |
@@ -283,8 +312,6 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
 ## 7. Transaction Boundaries, Delivery Semantics & Global Lock Order
 
 ### 7.1. Global Database Lock Order (Chống Deadlock Triệt Để)
-
-Để ngăn chặn hoàn toàn nguy cơ deadlock và đảo ngược thứ tự khóa (Lock Inversion), toàn bộ ứng dụng tuân thủ nghiêm ngặt **Thứ Tự Khóa Chuẩn Hóa Toàn Cục (Canonical Lock Acquisition Order)**:
 
 ```text
 ┌────────────────────────────────────────────────────────┐
@@ -297,68 +324,37 @@ uniqueIndex("idx_wallet_ledger_ref_kind_unique")
 │  5. delivery_jobs      (Delivery intent queue lock)    │
 └────────────────────────────────────────────────────────┘
 ```
-
 **Quy tắc bất biến (Lock Invariant Rules)**:
 1. Mọi transaction liên quan đến nhiều thực thể **BẮT BUỘC** phải xin khóa theo đúng chiều tăng dần từ 1 đến 5.
-2. **TUYỆT ĐỐI CẤM** luồng xin khóa ngược (ví dụ: `wallets -> discount_codes` là hành vi bất hợp pháp, bị từ chối ở tầng kiến trúc).
-3. Luồng nạp tiền SePay: Nếu chỉ tác động `wallet_topups` và `wallets`, thứ tự xin khóa chuẩn là: Khóa `wallets` trước -> sau đó khóa hoặc cập nhật `wallet_topups`.
-4. Luồng mua hàng có mã giảm giá: Khóa `discount_codes` trước -> sau đó khóa `wallets` -> tạo/khóa `orders`.
+2. **TUYỆT ĐỐI CẤM** luồng xin khóa ngược (ví dụ: `wallets -> discount_codes` là hành vi bất hợp pháp).
+3. **Pre-Read để xác định User**: Trước khi xin khóa `wallets`, hệ thống thực hiện **Pre-Read KHÔNG LOCK (`WITHOUT FOR UPDATE`)** để giải quyết `discordUserId`. Sau đó tiến hành khóa `wallets` trước rồi mới khóa `orders` hoặc `wallet_topups`.
 
 ---
 
-### 7.2. Phân định ngữ nghĩa Delivery & Crash Recovery Policy
+### 7.2. Đặc tả chi tiết luồng Webhook SePay Topup (Pre-Read & Canonical Lock Order)
 
-```text
-┌──────────────────────────────────────┐       ┌──────────────────────────────────────┐
-│        DATABASE DELIVERY STATE       │  vs   │       EXTERNAL DISCORD DELIVERY      │
-│            = IDEMPOTENT              │       │           = AT-LEAST-ONCE            │
-│  (delivery_jobs + delivery_logs)     │       │  (Discord API DM không có dedupe ID) │
-└──────────────────────────────────────┘       └──────────────────────────────────────┘
-```
-
-#### Kịch bản Crash Recovery & Phân biệt Requested vs Actual Method:
-1. **Trước khi gửi Discord API**:
-   - Worker claim job bằng atomic update:
-     ```sql
-     UPDATE delivery_jobs
-     SET status = 'processing',
-         claim_token = $claimUuid,
-         locked_at = now(),
-         external_attempt_count = external_attempt_count + 1
-     WHERE id = $jobId AND status = 'queued'
-     RETURNING id;
-     ```
-2. **Kịch bản Crash sau khi send thành công nhưng chưa kịp ghi `delivery_logs`**:
-   - Recovery Worker phát hiện job quá hạn có `external_attempt_count >= 1`:
-     - **Không spam lại tệp attachment** qua DM (tránh gửi 2 file nặng).
-     - Tạo một token tải dự phòng (`download_tokens`).
-     - Gửi thông báo DM ngắn kèm link dự phòng.
-     - Ghi nhận vào `delivery_logs`:
-       * `requestedMethod = 'attachment'`
-       * `actualMethod = 'fallback_link'`
-       * `deliveryIdempotencyKey = ${orderId}:attachment`
-     - Cập nhật `delivery_jobs.status = 'delivered'`.
-
----
-
-### 7.3. Đặc tả chi tiết các luồng giao dịch chuẩn hóa
-
-#### 1. Webhook SePay: Idempotency, Traceability & Tuân thủ Lock Order
 ```sql
+-- BƯỚC 0: Pre-read KHÔNG LOCK để xác định Identity & User sở hữu phiếu nạp
+SELECT id AS topup_id, discord_user_id AS user_id, status, amount
+FROM wallet_topups
+WHERE code = $code;
+
+-- Nếu không tìm thấy: Chuyển sang kiểm tra Order Bank Payment (Mục 7.3) hoặc ghi sepay_transactions 'unmatched'.
+
+-- BẮT ĐẦU TRANSACTION NGHIỆP VỤ:
 BEGIN TRANSACTION;
   -- 1. Dedupe webhook SePay
   INSERT INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, status, raw_payload, received_at)
   VALUES ($1, $amount, $type, $code, $content, $desc, 'received', $payload, now())
   ON CONFLICT (sepay_id) DO NOTHING
   RETURNING id;
-
   -- NẾU không có id trả về -> Webhook trùng -> COMMIT rỗng và RETURN { handled: 'duplicate' }
 
-  -- 2. Khóa ví người dùng trước (Tuân thủ Lock Order: wallets trước topups)
+  -- 2. Khóa ví người dùng (Lock Order #2)
   SELECT balance FROM wallets WHERE discord_user_id = $userId FOR UPDATE;
 
-  -- 3. Khóa phiếu nạp ví
-  SELECT * FROM wallet_topups WHERE code = $code FOR UPDATE;
+  -- 3. Khóa phiếu nạp ví (Lock Order #4)
+  SELECT * FROM wallet_topups WHERE id = $topupId FOR UPDATE;
 
   -- 4. Atomic status flip: Cho phép từ 'pending' HOẶC 'expired' sang 'credited'
   UPDATE wallet_topups
@@ -378,11 +374,11 @@ BEGIN TRANSACTION;
   VALUES ($userId, $amount, now(), now())
   ON CONFLICT (discord_user_id) DO UPDATE SET balance = wallets.balance + $amount, updated_at = now();
 
-  -- 7. Ghi ledger (Được bảo vệ bởi PARTIAL UNIQUE INDEX: ref_type, ref_id, kind)
+  -- 7. Ghi ledger (PARTIAL UNIQUE INDEX bảo vệ)
   INSERT INTO wallet_ledger (discord_user_id, delta, balance_after, kind, ref_type, ref_id, note, created_at)
   VALUES ($userId, $amount, new_balance, 'bank_topup', 'topup', $topupId, 'nạp ví SePay', now());
 
-  -- 8. Cập nhật Full Relational Traceability trên sepay_transactions
+  -- 8. Cập nhật Traceability trên sepay_transactions
   UPDATE sepay_transactions
   SET status = 'credited',
       topup_id = $topupId,
@@ -391,12 +387,121 @@ BEGIN TRANSACTION;
 
 COMMIT;
 
-[AFTER COMMIT - EXTERNAL SIDE EFFECTS]
+[AFTER COMMIT - EXTERNAL SIDE EFFECTS NGOÀI DB TRANSACTION]
   - Trả HTTP 200 OK cho SePay gateway.
-  - Gửi thông báo Discord DM thông báo số dư mới cho người dùng.
+  - Gửi Discord DM thông báo số dư mới cho người dùng.
 ```
 
-#### 2. Purchase + Discount + Durable Delivery Job (Tuân thủ Lock Order)
+---
+
+### 7.3. Đặc tả chi tiết luồng Order Bank Payment Transaction (Exact / Underpay / Overpay)
+
+Áp dụng khi SePay webhook nhận thanh toán trực tiếp cho một đơn hàng (`code` khớp với `orders.code`):
+
+```sql
+-- BƯỚC 0: Pre-read KHÔNG LOCK để xác định Identity đơn hàng và User sở hữu
+SELECT id AS order_id, discord_user_id AS user_id, status, bank_due, version_id, amount
+FROM orders
+WHERE code = $code;
+
+-- BẮT ĐẦU TRANSACTION NGHIỆP VỤ:
+BEGIN TRANSACTION;
+  -- 1. Dedupe webhook SePay
+  INSERT INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, status, raw_payload, received_at)
+  VALUES ($1, $amount, $type, $code, $content, $desc, 'received', $payload, now())
+  ON CONFLICT (sepay_id) DO NOTHING
+  RETURNING id;
+  -- NẾU không có id trả về -> Webhook trùng -> COMMIT rỗng và RETURN { handled: 'duplicate' }
+
+  -- 2. Khóa dòng liên quan theo Canonical Lock Order:
+  -- Lock Order #2 (wallets): Khóa ví người dùng trước
+  SELECT balance FROM wallets WHERE discord_user_id = $userId FOR UPDATE;
+  -- Lock Order #3 (orders): Khóa đơn hàng
+  SELECT * FROM orders WHERE id = $orderId FOR UPDATE;
+
+  -- 3. Validate trạng thái đơn hàng:
+  -- Bắt buộc: order.status == 'pending' VÀ order.bank_due > 0.
+  -- Nếu đơn hàng đã 'paid' hoặc 'cancelled':
+  -- -> Cập nhật sepay_transactions.status = 'duplicate_transfer', order_id = $orderId, COMMIT và dừng.
+
+  -- 4. So sánh số tiền thực nhận ($amount) với bank_due và phân nhánh xử lý:
+
+  -- TRƯỜNG HỢP A: EXACT PAYMENT ($amount == order.bank_due)
+  IF $amount = order.bank_due THEN
+    -- Cập nhật đơn hàng thành công
+    UPDATE orders
+    SET status = 'paid', bank_due = 0, updated_at = now()
+    WHERE id = $orderId;
+
+    -- Tạo Durable Delivery Job (Lock Order #5)
+    INSERT INTO delivery_jobs (order_id, discord_user_id, version_id, requested_method, status)
+    VALUES ($orderId, $userId, order.version_id, 'attachment', 'queued')
+    ON CONFLICT (order_id, requested_method) DO NOTHING;
+
+    -- Cập nhật Traceability
+    UPDATE sepay_transactions
+    SET status = 'credited', order_id = $orderId, processed_at = now()
+    WHERE id = $sepayTxId;
+
+  -- TRƯỜNG HỢP B: UNDERPAYMENT ($amount < order.bank_due)
+  ELSIF $amount < order.bank_due THEN
+    -- Không giao hàng. Ghi nhận số tiền thực nhận vào ví của khách để tiền không bị kẹt.
+    INSERT INTO wallets (discord_user_id, balance, created_at, updated_at)
+    VALUES ($userId, $amount, now(), now())
+    ON CONFLICT (discord_user_id) DO UPDATE SET balance = wallets.balance + $amount, updated_at = now();
+
+    -- Ghi sổ cái cho phần tiền nạp bù ví
+    INSERT INTO wallet_ledger (discord_user_id, delta, balance_after, kind, ref_type, ref_id, note, created_at)
+    VALUES ($userId, $amount, new_balance, 'order_partial_credit', 'order', $orderId, 'thanh toán thiếu tiền đơn hàng - cộng ví', now());
+
+    -- Đơn hàng giữ nguyên 'pending', bank_due giữ nguyên
+    -- Không tạo delivery_job
+
+    -- Cập nhật Traceability
+    UPDATE sepay_transactions
+    SET status = 'underpaid', order_id = $orderId, processed_at = now()
+    WHERE id = $sepayTxId;
+
+  -- TRƯỜNG HỢP C: OVERPAYMENT ($amount > order.bank_due)
+  ELSIF $amount > order.bank_due THEN
+    excess := $amount - order.bank_due;
+
+    -- Cập nhật đơn hàng thành công
+    UPDATE orders
+    SET status = 'paid', bank_due = 0, updated_at = now()
+    WHERE id = $orderId;
+
+    -- Cộng phần tiền thừa vào ví khách hàng
+    INSERT INTO wallets (discord_user_id, balance, created_at, updated_at)
+    VALUES ($userId, excess, now(), now())
+    ON CONFLICT (discord_user_id) DO UPDATE SET balance = wallets.balance + excess, updated_at = now();
+
+    -- Ghi sổ cái cho phần tiền thừa
+    INSERT INTO wallet_ledger (discord_user_id, delta, balance_after, kind, ref_type, ref_id, note, created_at)
+    VALUES ($userId, excess, new_balance, 'order_overpay_credit', 'order', $orderId, 'tiền thừa thanh toán đơn hàng - cộng ví', now());
+
+    -- Tạo Durable Delivery Job (Lock Order #5)
+    INSERT INTO delivery_jobs (order_id, discord_user_id, version_id, requested_method, status)
+    VALUES ($orderId, $userId, order.version_id, 'attachment', 'queued')
+    ON CONFLICT (order_id, requested_method) DO NOTHING;
+
+    -- Cập nhật Traceability
+    UPDATE sepay_transactions
+    SET status = 'overpaid', order_id = $orderId, processed_at = now()
+    WHERE id = $sepayTxId;
+  END IF;
+
+COMMIT;
+
+[AFTER COMMIT - EXTERNAL SIDE EFFECTS NGOÀI DB TRANSACTION]
+  - Trả HTTP 200 OK cho SePay gateway.
+  - Gửi Discord DM thông báo kết quả (Exact / Underpay / Overpay).
+  - Worker claim delivery_job bất đồng bộ để thực thi gửi file.
+```
+
+---
+
+### 7.4. Đặc tả luồng Purchase + Discount + Durable Delivery Job
 ```text
 BEGIN TRANSACTION
   1. Lock discount_codes (Lock Order #1):
@@ -431,14 +536,9 @@ BEGIN TRANSACTION
 COMMIT
 ```
 
-**Nguyên tắc Rollback tuyệt đối**:
-Nếu purchase rollback -> Toàn bộ discount redemption, usage count, wallet mutation, delivery job và order rollback sạch sẽ 100%.
-
 ---
 
 ## 8. Payment Amount Policy Matrix
-
-Hệ thống xử lý thanh toán SePay tuân thủ bảng chính sách tường minh, liên kết chặt chẽ với trạng thái `sepay_transactions.status`:
 
 | Tình Huống | Expected Amount | Received Amount | Result Code | SePay Status | Wallet Mutation | Topup / Order Status | Traceability & Notification |
 | :--- | :---: | :---: | :--- | :--- | :--- | :--- | :--- |
@@ -460,28 +560,20 @@ Local Secret Vault (`data/vault_secrets.db`) chỉ lưu trữ dữ liệu đã m
 
 1. **Vị Trí Lưu Trữ Master Key (Key Source)**:
    - **TUYỆT ĐỐI KHÔNG LƯU TRONG DATABASE** (`vault_secrets.db` hay Neon).
-   - Master key được nạp từ biến môi trường được bảo vệ: `VAULT_MASTER_KEY` (chuỗi hex 64 ký tự = 32 bytes entropy cao).
-   - Trong môi trường container/production: Inject thông qua Docker Secrets hoặc OS Secret Store.
+   - Nạp từ biến môi trường được bảo vệ: `VAULT_MASTER_KEY` (chuỗi hex 64 ký tự = 32 bytes entropy cao).
 2. **Khởi Động An Toàn (Startup Fail-Fast Behavior)**:
-   - Khi tiến trình bot khởi động: Kiểm tra sự tồn tại và độ dài của `VAULT_MASTER_KEY`.
-   - Nếu thiếu hoặc độ dài không hợp lệ (khác 32 bytes): **Lập tức dừng khởi động (`process.exit(1)`)** với thông báo lỗi tường minh:
-     `FATAL: VAULT_MASTER_KEY is missing or invalid. Refusing to start to protect credential vault integrity.`
+   - Thiếu hoặc độ dài khác 32 bytes -> **Lập tức dừng khởi động (`process.exit(1)`)**.
 3. **Quy Trình Xoay Khóa (Key Rotation Policy)**:
-   - Hệ thống hỗ trợ cấu hình 2 khóa cùng lúc: `VAULT_MASTER_KEY` (khóa hiện tại dùng mã hóa/giải mã) và `VAULT_MASTER_KEY_PREVIOUS` (khóa cũ chỉ dùng giải mã).
-   - Script xoay khóa (`pnpm tsx discord/scripts/rotate-vault-keys.ts`):
-     - Giải mã toàn bộ credentials bằng khóa cũ -> Mã hóa lại bằng khóa mới với IV ngẫu nhiên -> Cập nhật bản ghi trong `vault_secrets.db`.
-     - Sau khi xoay xong, gỡ bỏ `VAULT_MASTER_KEY_PREVIOUS`.
-4. **Chính Sách Sao Lưu & Bảo Vệ Khóa (Backup & Hygiene)**:
-   - Master key chỉ được sao lưu ngoại tuyến (Offline Cold Storage / Hardware Security Module / Password Manager của quản trị viên).
-   - Tuyệt đối không đưa master key vào bản backup cơ sở dữ liệu.
-   - Tuyệt đối không log giá trị master key ra console hay file log.
+   - Hỗ trợ dual-key (`VAULT_MASTER_KEY` active, `VAULT_MASTER_KEY_PREVIOUS` fallback).
+4. **Chính Sách Sao Lưu & Bảo Vệ Khóa**:
+   - Master key chỉ sao lưu ngoại tuyến, không đưa vào backup database, không log giá trị.
 
 ---
 
-## 10. Idempotent & Resumable Migration Strategy
+## 10. Idempotent & Resumable Migration Strategy (Atomic Checkpoints)
 
 ### 10.1. Deterministic Natural Business Key Strategy
-Mọi bảng Business được di chuyển theo quy trình tất định (Deterministic Lifecycle), cấm chèn mù (no blind insert):
+Mọi bảng Business được di chuyển theo quy trình tất định, cấm chèn mù:
 ```text
 Natural Business Key
         ↓
@@ -494,9 +586,9 @@ Reuse Existing OR Insert/Update
 Record In-Memory ID Mapping (SQLite ID -> Neon ID)
 ```
 
-**Chi tiết Natural Keys sử dụng**:
+**Natural Keys sử dụng**:
 - `plugins`: tra cứu qua `plugins.slug`.
-- `versions`: tra cứu qua `versions.sha256` hoặc `${pluginSlug}:${versionString}`.
+- `versions`: tra cứu qua `(plugin_id, version)` (SHA256 chỉ audit file).
 - `orders`: tra cứu qua `orders.code`.
 - `discount_codes`: tra cứu qua `discount_codes.code`.
 - `wallets`: tra cứu qua `wallets.discordUserId`.
@@ -504,62 +596,37 @@ Record In-Memory ID Mapping (SQLite ID -> Neon ID)
 - `card_topups`: tra cứu qua `card_topups.requestId`.
 - `spigot_accounts`: tra cứu và liên kết qua `accountId` (UUID).
 
-### 10.2. Resumable Checkpoints Architecture (`migration_checkpoints`)
-Để đảm bảo an toàn tuyệt đối khi process crash, đứt mạng hoặc timeout:
-1. Script chia quá trình di chuyển thành các checkpoint độc lập:
-   - `01_check_prerequisites`
-   - `02_migrate_plugins_and_versions`
-   - `03_migrate_wallets_and_ledger`
-   - `04_migrate_orders_and_items`
-   - `05_migrate_topups_and_payments`
-   - `06_migrate_account_refs`
-   - `07_sync_sequences`
-   - `08_final_reconciliation`
-2. Mỗi checkpoint hoàn thành được lưu vào bảng `migration_checkpoints` trên Neon kèm timestamp và checksum.
-3. Khi chạy lại (Rerun / Resume):
-   - Script đọc `migration_checkpoints`.
-   - Bỏ qua các bước đã hoàn tất hoặc tiếp tục từ `lastProcessedKey`.
-   - Đảm bảo: **Same SQLite Source + Same Neon Target = Chạy lại an toàn 100%, không sinh duplicate row, không hỏng khóa ngoại.**
+### 10.2. Migration Checkpoint Atomicity (Tính nguyên tử tuyệt đối theo Batch)
+Business data mutation và migration checkpoint/progress của cùng một batch **BẮT BUỘC PHẢI COMMIT ATOMICALLY TRONG CÙNG MỘT TRANSACTION**:
+
+```text
+BEGIN TRANSACTION;
+  1. Migrate batch dữ liệu nghiệp vụ (ví dụ: orders chunk 500 rows);
+  2. Validate tính tương thích và checksum của batch;
+  3. Update migration_checkpoints:
+     INSERT INTO migration_checkpoints (step_name, status, last_processed_key, processed_count, checksum, completed_at)
+     VALUES ($stepName, 'in_progress', $lastKey, $count, $checksum, now())
+     ON CONFLICT (step_name) DO UPDATE SET
+       last_processed_key = EXCLUDED.last_processed_key,
+       processed_count = EXCLUDED.processed_count,
+       checksum = EXCLUDED.checksum,
+       completed_at = now();
+COMMIT;
+```
+
+**Quy tắc an toàn khi Crash/Restart**:
+- Nếu process crash trước `COMMIT`: Toàn bộ batch dữ liệu nghiệp vụ và trạng thái checkpoint tự động rollback sạch sẽ.
+- Khi khởi động lại script: Hệ thống đọc `migration_checkpoints` đã commit ở batch trước và tiếp tục từ `lastProcessedKey`.
+- Tuyệt đối không xảy ra tình trạng: Business data đã commit nhưng checkpoint chưa ghi, hoặc checkpoint ghi hoàn thành nhưng business data bị lỗi.
 
 ### 10.3. Spigot Account UUID Identity Bridge
-Xóa bỏ hoàn toàn việc dùng `label` làm identity giữa Local và Neon.
-1. **Thiết kế UUID Bất Biến**:
-   - Mỗi tài khoản Spigot sở hữu một `account_id` dạng UUID v4 vĩnh viễn.
-   - Khi tách từ SQLite cũ: Nếu bản ghi cũ chỉ có ID integer, script sinh ra deterministic UUID (dựa trên UUIDv5 namespace hoặc gán UUIDv4 cố định và ghi ngược lại vào SQLite `vault_secrets.db`).
-2. **Cấu trúc lưu trữ**:
-   - **Local SQLite (`vault_secrets.db`)**: `account_id (UUID)`, `label`, `credentials` (mã hóa), `cookies`, `browser_profile`.
-   - **Neon PostgreSQL (`spigot_account_refs`)**: `account_id (UUID PK)`, `label`, `status`, `health`, `last_verified_at`.
-3. **Quy tắc bất biến**: Đổi tên `label` không làm thay đổi `account_id`, không làm đứt gãy mapping giữa Local Vault và Dashboard. Mật khẩu và session **tuyệt đối không bao giờ xuất hiện trên Neon**.
+Cố định `account_id` dạng UUID v4 bất biến giữa Local SQLite (`vault_secrets.db`) và Neon (`spigot_account_refs`). Đổi `label` không làm thay đổi hay đứt gãy liên kết `account_id`. Mật khẩu và session **tuyệt đối không bao giờ xuất hiện trên Neon**.
 
 ### 10.4. Wallet Opening Balance Reconstruction Logic
-Để đảm bảo tuyệt đối Invariant:
-$$\text{wallet.balance} = \sum \text{wallet\_ledger.delta}$$
-Script di chuyển kiểm tra tính toàn vẹn của lịch sử sổ cái SQLite:
-1. Tính tổng lịch sử: $S = \sum \text{sqlite\_wallet\_ledger.delta}$ cho từng user.
-2. So sánh với số dư hiện tại của ví $B = \text{sqlite\_wallets.balance}$.
-3. **Quyết Định Tạo Opening Balance**:
-   - NẾU $S == B$: Lịch sử hoàn toàn đầy đủ. **TUYỆT ĐỐI KHÔNG TẠO OPENING BALANCE** (tránh duplicate tiền).
-   - NẾU $S \neq B$ (do hệ thống cũ có giao dịch điều chỉnh không ghi ledger hoặc ledger bị dọn dẹp):
-     Tạo **đúng 1 dòng ledger mở sổ duy nhất (migration-only)**:
-     ```text
-     kind = 'opening_balance'
-     delta = (B - S)
-     ref_type = 'migration'
-     ref_id = user.id
-     note = 'Số dư ban đầu chuyển tiếp từ SQLite cũ'
-     ```
-     Sau bước này, tổng delta của ledger luôn khớp 100% với số dư ví $B$.
+Kiểm tra tính toàn vẹn của lịch sử sổ cái SQLite: Chỉ bù đúng 1 dòng `opening_balance` khi thật sự thiếu ($S \neq B$). Invariant số dư = tổng delta đạt 100%.
 
-### 10.5. Secret Migration Hygiene (Vệ sinh bảo mật tuyệt đối)
-Khi bóc tách `spigot_accounts` sang `vault_secrets.db`:
-1. **Xử lý tệp SQLite cũ**:
-   - Toàn bộ các tệp: `data/deps.db`, `data/deps.db-wal`, `data/deps.db-shm`, tệp snapshot backup cũ chứa credentials được phân loại là **Sensitive Tier 1 Artifacts**.
-   - Cấu hình phân quyền truy cập tệp cục bộ: `chmod 600` (chỉ user chạy bot có quyền đọc/ghi).
-   - Tuyệt đối cấm commit vào Git (`.gitignore` đã cấu hình chặn `data/*.db*`, `*.sqlite*`).
-2. **Loại bỏ Secret khỏi Migration Pipeline**:
-   - Script di chuyển chỉ trích xuất trường phi nhạy cảm (`account_id`, `label`, `status`, `health`, `last_verified_at`) nạp vào `spigot_account_refs` trên Neon.
-   - Tuyệt đối không serialize mật khẩu, cookie `xf_user`, session `xf_session` vào bất kỳ biến tạm, tệp JSON dump hay câu lệnh INSERT sang Neon.
-   - Tuyệt đối không log giá trị secret trong console hay migration log (mọi trường nhạy cảm phải hiển thị `[REDACTED]`).
+### 10.5. Secret Migration Hygiene
+Toàn bộ tệp SQLite cũ được bảo mật `chmod 600`, cấm commit Git, cấm serialize secret sang Neon, redact toàn bộ credential trong migration log.
 
 ---
 
@@ -569,7 +636,7 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 1. **Missing rows**: Bắt buộc = 0.
 2. **Duplicate rows**: Bắt buộc = 0.
 3. **Orphan foreign keys**: Bắt buộc = 0.
-4. **Business-key collisions**: Bắt buộc = 0 (`orders.code`, `wallets.discord_user_id`, `sepay_transactions.sepay_id`, `card_topups.request_id`, `plugins.slug`, `versions.sha256`, `spigot_account_refs.account_id`).
+4. **Business-key collisions**: Bắt buộc = 0 (`orders.code`, `wallets.discord_user_id`, `sepay_transactions.sepay_id`, `card_topups.request_id`, `plugins.slug`, `versions (plugin_id, version)`, `spigot_account_refs.account_id`).
 5. **Unexpected truncation**: Bắt buộc = 0.
 6. **Timestamp conversion**: Chuyển đổi chính xác Unix seconds sang UTC Timestamp with timezone.
 7. **Boolean conversion**: Chuyển đổi 0/1 sang `true`/`false`.
@@ -588,130 +655,74 @@ Kiểm định toàn diện 8 chiều sau di chuyển dữ liệu:
 
 ## 12. Cutover Plan (Timeline T-0 đến T+7)
 
-- **T-0 (00:00)**: **Freeze writes**. Bật cờ bảo trì trên Bot Discord (`MAINTENANCE_MODE=true`). Từ chối nhận đơn mới, hoãn xử lý webhook SePay.
-- **T+1 (00:01)**: **Online SQLite Backup**. Dùng `.backup()` API xuất snapshot ra tệp `data/backups/vault_cutover.db`. Chạy kiểm tra `PRAGMA integrity_check`.
-- **T+2 (00:03)**: **Migrate Business Data**. Chạy script `pnpm tsx discord/scripts/migrate-sqlite-to-neon-full.ts` (sử dụng Resumable Checkpoints và Deterministic Natural Business Key Mapping, chỉ chuyển Business Data và Public Account Refs có `account_id` UUID, tuyệt đối không chuyển mật khẩu hay cookie).
-- **T+3 (00:06)**: **Reconciliation & Validation**. Chạy bộ script đối soát: đếm dòng, kiểm tra business keys, xác thực `reconcileBalances == 0`, reset Postgres Sequences (`setval`).
-- **T+4 (00:08)**: **Switch Runtime**. Khởi động Bot Discord kết nối trực tiếp vào Neon Drizzle Client cho Business Data và Local Secret Vault cho Crawler Accounts. Ngắt kết nối SQLite nghiệp vụ hoàn toàn.
-- **T+5 (00:09)**: **Smoke Test**. Kiểm tra lệnh `/vi`, `/menu`, Dashboard API `/api/orders` xác nhận nhìn thấy đơn hàng tức thì.
-- **T+6 (00:10)**: **Enable Writes**. Tắt cờ bảo trì. Mở lại tiếp nhận thanh toán và đơn hàng bình thường.
+- **T-0 (00:00)**: **Freeze writes**. Bật cờ bảo trì trên Bot Discord (`MAINTENANCE_MODE=true`).
+- **T+1 (00:01)**: **Online SQLite Backup**. Dùng `.backup()` API xuất snapshot ra tệp `data/backups/vault_cutover.db`.
+- **T+2 (00:03)**: **Migrate Business Data**. Chạy script `pnpm tsx discord/scripts/migrate-sqlite-to-neon-full.ts` (Atomic Checkpoints, Natural Key Mapping).
+- **T+3 (00:06)**: **Reconciliation & Validation**. Chạy bộ script đối soát: đếm dòng, kiểm tra business keys, xác thực `reconcileBalances == 0`, reset Postgres Sequences.
+- **T+4 (00:08)**: **Switch Runtime**. Khởi động Bot Discord kết nối trực tiếp vào Neon Drizzle Client cho Business Data và Local Secret Vault cho Crawler Accounts.
+- **T+5 (00:09)**: **Smoke Test**. Kiểm tra lệnh `/vi`, `/menu`, Dashboard API `/api/orders`.
+- **T+6 (00:10)**: **Enable Writes**. Tắt cờ bảo trì. Mở lại tiếp nhận thanh toán bình thường.
 - **T+7 (00:11 - 00:40)**: **Monitor**. Giám sát log thời gian thực trong 30 phút.
 
 ---
 
 ## 13. Rollback Plan
 
-### Nguyên tắc Rollback an toàn (Tránh mất mát giao dịch mới):
-- **Tuyệt đối không rollback bằng cách ghi đè Neon bằng bản backup SQLite cũ**: Việc này sẽ xóa sạch toàn bộ các đơn hàng và tiền nạp mới phát sinh trên Neon sau thời điểm cutover!
-- **Cơ chế Rollback đúng**:
-  1. **Application Rollback (Nếu lỗi Code/Logic Bot)**: Deploy lại bản build bot trước đó nhưng **VẪN TRỎ VÀO CÙNG NEON DATABASE**. Dữ liệu nghiệp vụ trên Neon được bảo toàn 100%.
-  2. **Database Recovery (Nếu lỗi Schema/Migration Postgres)**: Khôi phục bằng tính năng **Neon Point-In-Time Recovery (PITR)** hoặc phục hồi từ bản snapshot của chính Neon.
-  3. **Bản backup SQLite**: Chỉ sử dụng làm tài liệu đối soát lịch sử (Forensics / Cold Archive) hoặc trường hợp khẩn cấp tái thiết lập lại toàn bộ hệ thống từ con số 0.
+- **Tuyệt đối không rollback bằng cách ghi đè Neon bằng bản backup SQLite cũ**.
+- Áp dụng **Application Rollback** (vẫn trỏ cùng Neon DB) hoặc **Neon PITR** (Point-In-Time Recovery).
 
 ---
 
-## 14. Final Acceptance Tests (Bản Toàn Diện v6)
+## 14. Final Acceptance Tests (Bản Toàn Diện v7)
 
-### 1. Migration Crash / Resume Test
-Mô phỏng ngắt tiến trình (kill -9) giữa chừng khi script migration đang chạy 50%:
+### A. SePay Wallet Topup Concurrency Test
+Hai webhook SePay gửi đồng thời cho cùng một mã `wallet_topups.code`:
 ```text
-Run 1: Chạy đến bước orders -> crash giả lập
-Run 2: Tiếp tục chạy lại migration
 Expected:
-Script nhận diện checkpoint đã hoàn thành
-Không sinh duplicate row
-Không thất thoát bản ghi
-Khóa ngoại nguyên vẹn 100%
+- Đúng 1 giao dịch credit tiền ví thành công
+- Đúng 1 dòng wallet_ledger được ghi
+- Topup chỉ chuyển từ 'pending' -> 'credited' đúng một lần
+- Webhook thứ hai cập nhật sepay status = 'duplicate_transfer', không credit đúp ví
 ```
 
-### 2. Account Identity Bridge Test
-Kiểm tra tính độc lập giữa định danh tài khoản và nhãn hiển thị:
+### B. Order Bank Payment Concurrency Test
+Hai webhook / request xử lý đồng thời cho cùng một đơn hàng `orders.code`:
 ```text
-Tài khoản cục bộ có account_id UUID
-Thay đổi label của tài khoản trên local hoặc Dashboard
 Expected:
-account_id trên Neon giữ nguyên vẹn
-Mapping không bị đứt gãy
-Mật khẩu/cookie vẫn nằm tại local SQLite, không bao giờ đẩy lên Neon
+- Không double payment (không trừ ví/không cộng đơn 2 lần)
+- Không double wallet_ledger
+- Đúng 1 delivery_job duy nhất được tạo (nhờ unique index order_id, requested_method)
+- Trạng thái đơn hàng nhất quán tuyệt đối (status = 'paid', bank_due = 0)
 ```
 
-### 3. Delivery Outcome Accuracy Test
-Mô phỏng crash sau khi Discord DM send thành công nhưng chưa commit log -> Recovery Worker xử lý:
+### C. Migration Crash / Resume Test
+Mô phỏng ngắt tiến trình (kill -9) tại nhiều checkpoint khác nhau (ví dụ: 25%, 50%, 75%):
 ```text
 Expected:
-delivery_logs ghi nhận chính xác:
-- requestedMethod = 'attachment'
-- actualMethod = 'fallback_link'
-Không ghi fallback link dưới danh nghĩa attachment
-Không gửi lặp file nặng qua Discord DM
+- Khởi động lại script migration an toàn 100%
+- Checkpoint khớp chính xác với business data đã commit
+- Không sinh duplicate rows
+- Không thất thoát dữ liệu
+- Khóa ngoại và sequence đồng bộ nguyên vẹn
 ```
 
-### 4. Global Lock Order Deadlock Freedom Test
-Mô phỏng 2 giao dịch đồng thời cạnh tranh tài nguyên theo đúng Canonical Lock Order:
-- Transaction A: `discount_codes` -> `wallets`
-- Transaction B: `discount_codes` -> `wallets`
+### D. Download Token Concurrent Access Test
+Hai request đồng thời gửi cùng một `token_hash`:
 ```text
 Expected:
-Cả 2 transaction hoàn tất tuần tự
-Không xảy ra Deadlock (DeadlockCount = 0)
-Không có hiện tượng Lock Inversion
+- Tối đa đúng 1 request claim thành công và nhận stream tệp (HTTP 200)
+- Request còn lại bị từ chối ngay lập tức (HTTP 410 Gone / 403 Forbidden)
+- Nếu tệp trên đĩa bị thiếu trước khi stream: Token được bồi hoàn unclaim (used_at = NULL) và trả HTTP 503
 ```
 
-### 5. Duplicate Topup Test
-Hai webhook khác `sepay_id` nhưng cùng `wallet_topups.code`:
+### E. Delivery Stale Recovery Test
+Worker claim job (`status = 'processing'`), sau đó tiến trình crash đột ngột:
 ```text
 Expected:
-1 wallet credit
-1 ledger entry
-topup status = credited
-Webhook thứ 2 cập nhật sepay status = 'duplicate_transfer', không credit ví lần 2
-```
-
-### 6. Concurrent First Redemption Test
-Hai purchase đồng thời với cùng discount + cùng user (`per_user_limit = 1`):
-```text
-Expected:
-respect per_user_limit
-no duplicate redemption
-Đúng 1 đơn được giảm giá; đơn thứ hai tính nguyên giá
-```
-
-### 7. Purchase Failure After Discount Validation Test
-Simulate DB failure sau discount validation trong cùng transaction:
-```text
-Expected:
-no redemption
-no used_count increment
-no wallet mutation
-no delivery job
-no order
-```
-
-### 8. Download Token Atomic Consumption Test
-2 requests đồng thời gửi cùng một `token_hash`:
-```text
-Expected:
-exactly 1 success (nhận stream file 200 OK)
-exactly 1 rejected (nhận 410 Gone / 403 Forbidden)
-Không tải đúp file
-```
-
-### 9. Duplicate Delivery Job Test
-Hai request đồng thời tạo delivery job cho cùng một `order_id` và cùng một `requested_method`:
-```text
-Expected:
-Đúng 1 delivery job duy nhất được tạo trong database nhờ unique constraint (order_id, requested_method)
-Request thứ 2 tái sử dụng job hiện có
-```
-
-### 10. Expired Topup Paid Later Test
-Phiếu nạp tiền đã chuyển sang `expired` do hết hạn, sau đó khách chuyển tiền tới SePay:
-```text
-Expected:
-Topup chuyển trạng thái từ 'expired' -> 'credited'
-Cộng đủ tiền vào ví người dùng và ghi sổ cái
-Cập nhật sepay_transactions status = 'credited', topup_id = $topupId
-Gửi thông báo DM ghi nhận thanh toán muộn thành công theo đúng Payment Amount Policy Matrix
+- Sau khi hết hạn lease (locked_at < now() - 5 phút), job được coi là stale
+- Worker khác tự động reclaim an toàn bằng claim_token mới
+- Không tạo duplicate delivery intent
+- Thực hiện giao hàng thành công và ghi delivery_logs ('requested' = attachment, 'actual' = fallback_link)
 ```
 
 ---
@@ -721,29 +732,31 @@ Gửi thông báo DM ghi nhận thanh toán muộn thành công theo đúng Paym
 1. [packages/db/src/schema.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/packages/db/src/schema.ts):
    - Thêm định nghĩa 6 bảng Business: `wallet_topups`, `discount_code_redemptions`, `download_tokens`, `delivery_logs`, `delivery_jobs`, `migration_checkpoints`.
    - Thêm **Partial Unique Index** trên `wallet_ledger`: `uniqueIndex('idx_wallet_ledger_ref_kind_unique').on(table.refType, table.refId, table.kind).where(sql\`ref_type != '' AND ref_id IS NOT NULL\`)`.
+   - Thêm **Unique Index `(pluginId, version)`** trên bảng `versions`.
    - Bổ sung trường `description`, `status`, `orderId`, `topupId`, `processedAt` vào bảng `sepay_transactions`.
    - Bổ sung **Unique Index `(orderId, requestedMethod)`** trên bảng `delivery_jobs`.
-   - Thêm trường `requestedMethod` và `actualMethod` vào bảng `delivery_logs`.
+   - Bổ sung `requestedMethod` và `actualMethod` vào bảng `delivery_logs`.
+   - Thêm trường `failureReason` vào bảng `download_tokens`.
    - Chuẩn hóa bảng `spigotAccounts` thành `spigotAccountRefs` với khóa chính `accountId: uuid().primaryKey()`.
 2. [discord/src/index.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/index.ts):
    - Xóa bỏ `autoSyncSqliteToNeonIfEmpty`.
    - Chuyển toàn bộ Dependency Injection `db` nghiệp vụ sang `neonDb`.
-   - Tách riêng kết nối `vaultSecretsDb` (SQLite nội bộ) chỉ dùng cho Spigot crawler và browser launcher.
-   - Kiểm tra `VAULT_MASTER_KEY` khi khởi động bot (Fail-fast).
+   - Tách riêng kết nối `vaultSecretsDb` (SQLite nội bộ) cho Spigot accounts.
+   - Kiểm tra `VAULT_MASTER_KEY` fail-fast khi khởi động.
 3. [discord/src/repositories/neon-wallets.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/repositories/neon-wallets.ts):
    - Viết lại `applyLedgerEntry` sử dụng `db.transaction()` và tuân thủ Canonical Lock Order.
    - Bổ sung `listLedger`, `listWallets`, `countWallets`, `sumWalletBalances`, `reconcileBalances`.
 4. [discord/src/repositories/neon-orders.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/repositories/neon-orders.ts):
    - Bổ sung `expireStaleOrders`, `refundOrderWallet`, `listUndeliveredPaidOrders`.
 5. [discord/src/services/payment/match-and-fulfil-order.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/payment/match-and-fulfil-order.ts):
-   - Áp dụng Canonical Lock Order: Khóa `wallets` trước -> khóa `wallet_topups`.
-   - Tích hợp Payment Amount Policy Matrix và traceability `sepay_transactions`.
-   - Tích hợp luồng Purchase + Discount + Durable Delivery Job tuân thủ Lock Order.
+   - Áp dụng Pre-Read không lock để lấy `discordUserId` trước khi xin khóa theo Canonical Lock Order.
+   - Tích hợp đầy đủ transaction Order Bank Payment cho cả 3 trường hợp (Exact, Underpay, Overpay).
+   - Tách toàn bộ External Side Effects ra ngoài DB transaction.
 6. [discord/src/services/delivery/deliver-version.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/delivery/deliver-version.ts):
+   - Tích hợp Lease Timeout & Worker Stale Recovery Policy với `claimToken`.
    - Phân biệt rõ `requestedMethod` và `actualMethod` khi ghi log.
-   - Áp dụng Worker Recovery Policy khi xảy ra crash sau send.
 7. [discord/src/services/delivery/mint-download-token.ts](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/delivery/mint-download-token.ts):
-   - Chuyển sang sử dụng bảng `download_tokens` trên Neon với Atomic Consumption logic.
+   - Triển khai Authorization và Failure Policy: Validate -> Atomic Claim -> Verify File -> Stream, kèm bồi hoàn unclaim token nếu tệp bị thiếu.
 
 ---
 
@@ -751,37 +764,36 @@ Gửi thông báo DM ghi nhận thanh toán muộn thành công theo đúng Paym
 
 1. `discord/src/repositories/neon-wallet-topups.ts`: Quản lý nạp tiền ngân hàng trên Neon (hỗ trợ `expired -> credited`).
 2. `discord/src/repositories/neon-card-topups.ts`: Quản lý nạp thẻ cào Card2k trên Neon.
-3. `discord/src/repositories/neon-download-tokens.ts`: Quản lý token tải file bảo mật với atomic mutation.
+3. `discord/src/repositories/neon-download-tokens.ts`: Quản lý token tải file với atomic claim và compensation logic.
 4. `discord/src/repositories/neon-delivery-logs.ts`: Quản lý nhật ký phát file kèm `requestedMethod` và `actualMethod`.
-5. `discord/src/repositories/neon-delivery-jobs.ts`: Hàng đợi giao hàng bền vững với ràng buộc Unique `(order_id, requested_method)`.
+5. `discord/src/repositories/neon-delivery-jobs.ts`: Hàng đợi giao hàng bền vững với Lease Timeout, Claim Token và Stale Recovery Worker.
 6. `discord/src/repositories/neon-spigot-refs.ts`: Quản lý tham chiếu trạng thái Spigot qua UUID bất biến.
-7. `discord/scripts/migrate-sqlite-to-neon-full.ts`: Script di chuyển dữ liệu nghiệp vụ có Resumable Checkpoints, UUID Account Bridge, Opening Balance logic, và Secret Hygiene.
-8. `discord/tests/neon-payment-atomicity.test.ts`: Bộ kiểm thử tự động kiểm tra tính nguyên tử, idempotency, atomic consumption, duplicate jobs, crash recovery, lock order không deadlock và concurrency trên Neon.
+7. `discord/scripts/migrate-sqlite-to-neon-full.ts`: Script di chuyển dữ liệu nghiệp vụ hỗ trợ Atomic Checkpoint Batches, UUID Account Bridge, Opening Balance logic, và Secret Hygiene.
+8. `discord/tests/neon-payment-atomicity.test.ts`: Bộ kiểm thử tự động toàn diện kiểm tra tính nguyên tử, idempotency, atomic consumption, duplicate jobs, lease recovery, lock order không deadlock và concurrency trên Neon.
 
 ---
 
 ## 17. Acceptance Criteria
 
 1. [ ] **Dual-Vault Boundary Enforced**: Tuyệt đối không có mật khẩu, cookie, hay session nào của Spigot được lưu trữ hoặc chuyển lên Neon. Toàn bộ credential upstream được cô lập tại Local Secret Vault.
-2. [ ] **Spigot Account UUID Bridge Enforced**: Liên kết qua `accountId` UUID bất biến; đổi `label` không làm mất liên kết; mật khẩu và cookie không bao giờ xuất hiện trên Neon.
-3. [ ] **Resumable Migration Verified**: Script migration có checkpoints; gặp crash hoặc timeout chạy lại vẫn an toàn tuyệt đối, không sinh duplicate row hay đứt gãy khóa ngoại.
-4. [ ] **Global Lock Order Applied**: Toàn bộ các transaction tuân thủ thứ tự: `discount_codes` -> `wallets` -> `orders` -> `wallet_topups` -> `delivery_jobs`. Không xảy ra Lock Inversion hay Deadlock.
-5. [ ] **Delivery Outcome Formally Distinguished**: `requestedMethod` và `actualMethod` được phân biệt rõ; crash recovery ghi đúng `actualMethod = 'fallback_link'`.
-6. [ ] **Master Encryption Key Isolated**: Master key không nằm trong database, nạp từ `VAULT_MASTER_KEY` môi trường, kiểm tra fail-fast khi khởi động.
-7. [ ] **No Production SQLite Business Writes**: Không còn câu lệnh ghi dữ liệu nghiệp vụ (orders, wallets, ledger, payments) nào vào SQLite tại runtime production.
-8. [ ] **Single Source of Truth Verified**: Discord Bot và Web Dashboard cùng đọc/ghi một hàng dữ liệu đơn hàng và số dư ví trên Neon theo thời gian thực.
-9. [ ] **Partial Unique Index Applied**: Sử dụng Partial Unique Index trên `wallet_ledger`, ngăn nạp đúp tiền ở mức database mà không vi phạm cú pháp PostgreSQL.
-10. [ ] **Payment Traceability Established**: Mọi bản ghi `sepay_transactions` lưu vết rõ ràng `order_id`, `topup_id`, `status` tường minh và `processed_at`.
-11. [ ] **Payment Policy Strictly Applied**: Toàn bộ ma trận số tiền (Exact, Underpay, Overpay, Unknown, Expired, Duplicate) hoạt động đúng chính sách tường minh.
-12. [ ] **Expired Topup Handled**: Topup hết hạn chuyển trạng thái hợp lệ sang `credited` khi tiền về muộn, không làm thất thoát tiền của khách.
-13. [ ] **Durable Delivery Job Unique**: Ràng buộc Unique `(order_id, requested_method)` trên `delivery_jobs` đảm bảo đúng 1 active delivery intent per method.
-14. [ ] **Download Token Atomically Consumed**: 2 request đồng thời tới cùng một token hash chỉ có đúng 1 request tải thành công.
-15. [ ] **Wallet Opening Balance Reconciled**: Tự động nhận diện tính toàn vẹn của ledger; chỉ bù 1 dòng `opening_balance` khi thật sự thiếu; invariant số dư = tổng delta đạt 100%.
-16. [ ] **Secret Migration Hygiene**: Artifacts cũ (db, wal, dumps) được bảo vệ, cấm commit Git, cấm log mật khẩu.
-17. [ ] **Discount Concurrency Controlled**: Concurrent redemptions được serialize an toàn nhờ lock parent row `discount_codes`, tôn trọng `per_user_limit` và `max_uses`.
-18. [ ] **Purchase + Discount Unified in 1 Transaction**: Nếu purchase lỗi giữa chừng, toàn bộ discount redemption, usage count, order và wallet mutation đều rollback sạch sẽ.
-19. [ ] **Existing UX Unchanged**: Trải nghiệm nút bấm, modal, menu trên Bot Discord và Web Dashboard giữ nguyên 100%.
-20. [ ] **Existing Tests Pass**: Toàn bộ 34 test suites hiện tại vượt qua 100%.
+2. [ ] **Pre-Read & Canonical Lock Order Enforced**: SePay webhook thực hiện Pre-Read không lock để tìm user trước khi xin khóa theo thứ tự: `1. discount_codes -> 2. wallets -> 3. orders -> 4. wallet_topups -> 5. delivery_jobs`. Không xảy ra Lock Inversion hay Deadlock.
+3. [ ] **Order Bank Payment Fully Specified**: Cả 3 trường hợp Exact, Underpay, Overpay hoạt động nguyên tử trong 1 transaction, side effects chạy sau commit.
+4. [ ] **Migration Checkpoint Atomicity Verified**: Dữ liệu nghiệp vụ và checkpoint của cùng một batch commit atomically trong 1 transaction; restart/crash nhiều lần an toàn 100%.
+5. [ ] **Version Business Identity Defined**: Natural key của versions là `(plugin_id, version)` có unique index; SHA256 chỉ dùng để audit và kiểm tra toàn vẹn file.
+6. [ ] **Download Token Failure Policy Applied**: Endpoint kiểm tra tuần tự; nếu tệp bị thiếu trước khi stream, tự động bồi hoàn unclaim token (`used_at = NULL`) và trả HTTP 503.
+7. [ ] **Delivery Job Lease & Recovery Active**: Job có `claimToken`, timeout lease 5 phút; worker crash tự động được worker khác reclaim an toàn, không sinh duplicate intent.
+8. [ ] **Spigot Account UUID Bridge Enforced**: Liên kết qua `accountId` UUID bất biến; đổi `label` không làm mất liên kết; mật khẩu và cookie không bao giờ xuất hiện trên Neon.
+9. [ ] **Master Encryption Key Isolated**: Master key không nằm trong database, nạp từ `VAULT_MASTER_KEY` môi trường, kiểm tra fail-fast khi khởi động.
+10. [ ] **No Production SQLite Business Writes**: Không còn câu lệnh ghi dữ liệu nghiệp vụ (orders, wallets, ledger, payments) nào vào SQLite tại runtime production.
+11. [ ] **Single Source of Truth Verified**: Discord Bot và Web Dashboard cùng đọc/ghi một hàng dữ liệu đơn hàng và số dư ví trên Neon theo thời gian thực.
+12. [ ] **Partial Unique Index Applied**: Sử dụng Partial Unique Index trên `wallet_ledger`, ngăn nạp đúp tiền ở mức database mà không vi phạm cú pháp PostgreSQL.
+13. [ ] **Payment Traceability Established**: Mọi bản ghi `sepay_transactions` lưu vết rõ ràng `order_id`, `topup_id`, `status` tường minh và `processed_at`.
+14. [ ] **Expired Topup Handled**: Topup hết hạn chuyển trạng thái hợp lệ sang `credited` khi tiền về muộn, không làm thất thoát tiền của khách.
+15. [ ] **Delivery Outcome Formally Distinguished**: `requestedMethod` và `actualMethod` được phân biệt rõ; crash recovery ghi đúng `actualMethod = 'fallback_link'`.
+16. [ ] **Wallet Opening Balance Reconciled**: Tự động nhận diện tính toàn vẹn của ledger; chỉ bù 1 dòng `opening_balance` khi thật sự thiếu; invariant số dư = tổng delta đạt 100%.
+17. [ ] **Secret Migration Hygiene**: Artifacts cũ (db, wal, dumps) được bảo vệ, cấm commit Git, cấm log mật khẩu.
+18. [ ] **Existing UX Unchanged**: Trải nghiệm nút bấm, modal, menu trên Bot Discord và Web Dashboard giữ nguyên 100%.
+19. [ ] **Existing Tests Pass**: Toàn bộ 34 test suites hiện tại vượt qua 100%.
 
 ---
 
@@ -789,12 +801,12 @@ Gửi thông báo DM ghi nhận thanh toán muộn thành công theo đúng Paym
 
 | Rủi ro kỹ thuật | Mức độ | Nguyên nhân gốc rễ | Biện pháp giảm thiểu triệt để |
 | :--- | :---: | :--- | :--- |
-| **Đứt gãy liên kết Account khi đổi tên** | **Cao** | Dùng `label` làm khóa tự nhiên liên kết giữa Local và Neon. | **UUID Identity Bridge**: Cố định `account_id` dạng UUID v4 vĩnh viễn; `label` chỉ là thuộc tính hiển thị. |
-| **Deadlock do Lock Inversion** | **Cao** | Các transaction khác nhau xin khóa các bảng theo thứ tự đảo ngược. | **Canonical Lock Order**: Bắt buộc xin khóa theo thứ tự duy nhất: `discount_codes` -> `wallets` -> `orders` -> `wallet_topups`. |
-| **Crash khi Migration gây dữ liệu dở dang** | **Cao** | Script migration chèn mù (blind insert), chạy lại bị trùng lặp hoặc fail. | **Resumable Checkpoints**: Lưu vết tiến trình vào `migration_checkpoints`, kiểm tra natural key trước khi xử lý từng dòng. |
-| **Báo cáo sai lệch phương thức giao file** | **Trung bình** | Ghi nhận fallback link dưới danh nghĩa file đính kèm. | **Intent vs Outcome**: Phân định rõ `requestedMethod = 'attachment'` và `actualMethod = 'fallback_link'`. |
+| **Deadlock do Lock Inversion** | **Cao** | Khóa ví trước khi biết user hoặc xin khóa các bảng ngược chiều. | **Pre-Read & Canonical Lock Order**: Pre-read không lock để lấy `discordUserId`, sau đó xin khóa theo đúng thứ tự 1 -> 5. |
+| **Mất Token khi Tệp hỏng/mất** | **Cao** | Token bị claim (`used_at = now()`) nhưng server không tìm thấy file jar. | **Compensation Unclaim**: Tự động bồi hoàn `used_at = NULL`, trả HTTP 503 và alert Staff. |
+| **Treo Delivery Job khi Worker Crash** | **Cao** | Worker nhận job đang gửi thì bị crash, job vĩnh viễn ở trạng thái `processing`. | **Lease & Stale Recovery**: Quá hạn 5 phút tự động cho phép worker khác reclaim bằng `claim_token` mới. |
+| **Lệch trạng thái Checkpoint Migration** | **Cao** | Dữ liệu commit nhưng checkpoint lỗi (hoặc ngược lại). | **Batch Atomicity**: Gom mutation business data và checkpoint của batch vào cùng 1 transaction. |
+| **Đứt gãy liên kết Account khi đổi tên** | **Cao** | Dùng `label` làm khóa tự nhiên liên kết giữa Local và Neon. | **UUID Identity Bridge**: Cố định `account_id` dạng UUID v4 vĩnh viễn. |
 | **Rò rỉ Spigot Credentials / Master Key** | **Nghiêm trọng** | Lưu trữ master key hoặc đồng bộ secret accounts lên Cloud DB. | **Dual-Vault Boundary**: Master key lưu ngoài DB; credentials lưu tại local SQLite `data/vault_secrets.db` mã hóa AES-256-GCM. |
-| **Nạp đúp tiền ví hoặc sai lệch số dư** | **Nghiêm trọng** | Webhook lặp, underpay/overpay không xác định, hoặc duplicate opening balance. | Atomic status update `WHERE status IN ('pending', 'expired')`, chính sách số tiền tường minh, và Partial Unique Index trên ledger. |
 | **Mất giao dịch khi Rollback sai cách** | **Nghiêm trọng** | Khôi phục database bằng cách ghi đè backup SQLite cũ sau cutover. | **Cấm Rollback ghi đè DB**: Chỉ Rollback Application code; nếu lỗi DB thì dùng Neon PITR. |
 
 ---

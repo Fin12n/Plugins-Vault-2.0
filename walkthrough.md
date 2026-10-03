@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v6: Resumable Checkpoints, UUID Account Bridge & Global Lock Order)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v7: Pre-Read Lock Order, Batch Atomicity & Lease Recovery)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,22 +172,26 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v6 (Final Blocker Corrections):
-1. **Idempotent & Resumable Migration (`migration_checkpoints`)**:
-   - Migration an toàn tuyệt đối trước mọi sự cố crash/mất mạng giữa chừng (ví dụ 50%). Khi chạy lại, script tự động resume từ checkpoint, không sinh duplicate rows hay hỏng khóa ngoại.
-2. **Spigot Account UUID Identity Bridge**:
-   - Loại bỏ hoàn toàn việc dùng `label` làm định danh khóa chính. Cố định `account_id` dạng UUID v4 bất biến giữa Local SQLite (`vault_secrets.db`) và Neon (`spigot_account_refs`). Đổi `label` không làm đứt gãy liên kết tài khoản.
-3. **Phân Định Rõ Ràng Delivery Intent vs Delivery Outcome**:
-   - `delivery_jobs` lưu `requestedMethod` (ví dụ `attachment`).
-   - `delivery_logs` lưu cả `requestedMethod` và `actualMethod`. Khi crash recovery kích hoạt, ghi nhận chính xác `requestedMethod = 'attachment'`, `actualMethod = 'fallback_link'`, tuyệt đối không ghi nhận fallback link dưới danh nghĩa attachment.
-4. **Thứ Tự Khóa Chuẩn Hóa Toàn Cục (Canonical Database Lock Order)**:
-   - Áp dụng thứ tự khóa thống nhất trên toàn bộ repository: `1. discount_codes -> 2. wallets -> 3. orders -> 4. wallet_topups -> 5. delivery_jobs`. Triệt tiêu hoàn toàn Lock Inversion và loại bỏ rủi ro Deadlock.
-5. **Bộ Kiểm Thử Acceptance Toàn Diện v6**:
-   - Migration Crash / Resume Test (crash 50% rồi tiếp tục thành công).
-   - Account Identity Bridge Test (thay đổi `label` giữ nguyên `account_id`).
-   - Delivery Outcome Accuracy Test (`requested = attachment`, `actual = fallback_link`).
-   - Global Lock Order Deadlock Freedom Test (chạy đồng thời 2 luồng không deadlock).
-6. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v7 (Final Implementation Clarifications):
+1. **SePay Pre-Read & Canonical Lock Order**:
+   - Webhook SePay bắt buộc thực hiện Pre-Read KHÔNG LOCK (`WITHOUT FOR UPDATE`) để xác định `discordUserId` trước khi xin khóa hàng. Sau đó toàn bộ transaction tuân thủ Canonical Lock Order: `wallets -> orders -> wallet_topups`.
+2. **Đặc Tả Đầy Đủ Transaction Order Bank Payment**:
+   - Xây dựng đặc tả chi tiết trong 1 transaction duy nhất cho cả 3 trường hợp: **Exact** (hoàn tất đơn + tạo delivery job), **Underpayment** (không giao hàng, nạp số tiền thực nhận vào ví khách), **Overpayment** (hoàn tất đơn, cộng phần tiền thừa vào ví khách + tạo delivery job). Toàn bộ side effects (DM, HTTP 200, delivery) nằm ngoài DB transaction.
+3. **Migration Batch Checkpoint Atomicity**:
+   - Dữ liệu nghiệp vụ và checkpoint của cùng một batch (chunk) bắt buộc phải commit cùng nhau trong 1 transaction. Crash trước commit -> batch tự động chạy lại sạch sẽ mà không lệch checkpoint.
+4. **Chuẩn Hóa Natural Key Phiên Bản Plugin**:
+   - Business identity của version là `(plugin_id, version)` kèm unique index `idx_versions_plugin_version`. SHA256 chỉ dùng để audit và kiểm tra toàn vẹn file.
+5. **Download Token Authorization & Failure Compensation Policy**:
+   - Quy trình endpoint `/download/:token` chặt chẽ. Nếu file trên ổ cứng bị thiếu trước khi stream: Tự động bồi hoàn unclaim token (`used_at = NULL`), trả HTTP 503 và bảo lưu quyền tải cho khách.
+6. **Delivery Job Lease & Stale Recovery**:
+   - Cung cấp cơ chế Lease 5 phút với `claimToken`. Worker crash đột ngột sẽ được worker khác reclaim an toàn, không sinh duplicate delivery intent.
+7. **Bộ Kiểm Thử Acceptance Toàn Diện v7 (A -> E)**:
+   - SePay wallet topup concurrency (1 credit, 1 ledger).
+   - Order bank payment concurrency (không double payment/ledger/job).
+   - Migration crash/resume (atomic batch checkpoint).
+   - Download token concurrent access (tối đa 1 claim thành công).
+   - Delivery stale recovery (reclaim tự động khi worker crash).
+8. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
