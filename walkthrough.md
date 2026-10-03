@@ -163,35 +163,34 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa 2026-10-03)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v2: Dual-Vault & Business Authority)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
-- **Mục tiêu**: Đưa **Neon PostgreSQL** trở thành **Single Source of Truth** duy nhất cho toàn bộ dữ liệu nghiệp vụ, xóa bỏ hiện tượng chia tách dữ liệu (Split-Brain) giữa Discord Bot và Web Dashboard mà không thay đổi UI/UX hay viết lại bot.
+- **Tôn chỉ kiến trúc tối thượng**:
+  ```text
+  LOCAL DATABASE  = SECRET / PRIVATE ACCOUNT VAULT (Cô lập credential, cookie, crawler)
+  NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng)
+  ```
 
-### 🔍 Kết Quả Chuẩn Hóa & Bổ Sung Bắt Buộc (Mandatory Corrections):
-1. **Tính Nguyên Tử Cho Webhook SePay (Transaction Atomicity & Idempotency)**:
-   - Loại bỏ mô hình tách rời `INSERT sepay_transactions` độc lập.
-   - Toàn bộ thao tác: Ghi nhận giao dịch SePay, Khóa hàng `SELECT ... FOR UPDATE`, Cập nhật trạng thái đơn/phiếu nạp, và Ghi sổ cái số dư ví bắt buộc phải nằm trong **CÙNG MỘT TRANSACTION BOUNDARY**.
-   - Nếu tiến trình sập trước `COMMIT`, toàn bộ rollback sạch sẽ; webhook gửi retry sẽ được xử lý lại từ đầu nguyên tử, không rơi vào trạng thái dở dang.
-2. **Cô Lập Tuyệt Đối Các Side Effects Ra Ngoài Transaction**:
-   - Cấm giữ transaction mở trong khi: gọi Discord API (gửi DM, gửi embed), gọi HTTP (Card2k, Spigot), chạy CloakBrowser, hoặc đọc/ghi file jar trên ổ đĩa. Toàn bộ side effects chỉ chạy sau khi transaction đã `COMMIT` thành công.
-3. **Bất Biến Số Dư Ví (Wallet Invariant)**:
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Cuối Cùng (Final Architecture Corrections):
+1. **Ranh Giới Bảo Mật Tuyệt Đối (Secret Vault Isolation)**:
+   - **Local SQLite (`data/vault_secrets.db`)**: Lưu trữ cục bộ toàn bộ thông tin nhạy cảm của Spigot (`username`, `password_encrypted`, `cookies`, `session`, `browser_profile`) và cờ thu thập `account_scan_state`. **Tuyệt đối không lưu mật khẩu hay cookie trên Neon Cloud Database!**
+   - **Neon PostgreSQL**: Chỉ lưu trữ dữ liệu nghiệp vụ và các tham chiếu tài khoản công khai (`spigot_account_refs`: `id`, `label`, `status`, `health`) để Dashboard hiển thị trạng thái mà không bao giờ lộ credentials.
+2. **Tính Nguyên Tử Cho Webhook SePay (Transaction Atomicity & Idempotency)**:
+   - Gom toàn bộ thao tác: Ghi nhận giao dịch SePay (`ON CONFLICT DO NOTHING RETURNING id`), Khóa hàng `SELECT ... FOR UPDATE`, Cập nhật đơn/topup, và Ghi sổ cái số dư ví vào **CÙNG MỘT TRANSACTION BOUNDARY**.
+   - Nếu sập nguồn trước khi `COMMIT`, toàn bộ rollback sạch sẽ; webhook gửi retry sẽ được xử lý lại nguyên tử.
+3. **Cô Lập Tuyệt Đối Side Effects Ra Ngoài Transaction**:
+   - Cấm giữ transaction mở trong khi: gửi tin nhắn Discord DM, gọi API Card2k/Spigot, chạy CloakBrowser, hoặc đọc/ghi file jar trên ổ đĩa. Side effects chỉ chạy sau khi transaction đã `COMMIT` thành công.
+4. **Bất Biến Số Dư Ví (Wallet Invariant)**:
    - Đảm bảo bất biến tuyệt đối: `wallets.balance == SUM(wallet_ledger.delta)` cho 100% người dùng.
    - Sử dụng `SELECT ... FOR UPDATE` trong transaction Neon để chống race condition khi mở đơn hoặc nạp tiền đồng thời.
-4. **Đối Soát Nghiệp Vụ Sau Di Chuyển (Business-Key Reconciliation)**:
-   - Kiểm tra 8 chiều đối soát: `orders.code`, `wallets.discord_user_id`, `sepay_transactions.sepay_id`, `card_topups.request_id`, `plugins.slug`, `versions.sha256`.
-   - Kết quả bắt buộc: Missing = 0, Duplicate = 0, Orphan foreign keys = 0, Unexpected truncation = 0.
-5. **Chính Sách Xử Lý Dữ Liệu Trùng Lặp Trên Neon (Conflict Policy)**:
-   - Không giả định Neon rỗng:
-     * `staffs`: Merge (ưu tiên cấu hình RBAC trên Dashboard).
-     * `audit_logs`: Tách biệt hoàn toàn (Neon cho Staff RBAC; SQLite chuyển sang `delivery_logs`).
-     * `discord_channels`: Prefer Neon.
-     * `orders`: Trùng code khác user -> **Dừng migration ngay lập tức để Admin can thiệp thủ công**.
-     * `wallets`: Lệch số dư -> Reconcile theo tổng lịch sử sổ cái `wallet_ledger`.
-6. **Sao Lưu SQLite Chuẩn Xác (Zero Corruption Backup)**:
-   - Thay thế việc copy file thô bằng **SQLite Online Backup API** (`better-sqlite3: .backup()`) kết hợp đóng băng cờ ghi, kiểm tra `PRAGMA integrity_check` và chạy thử nghiệm restore trước khi migrate.
-7. **Kế Hoạch Chuyển Mạch & Rút Lui (Cutover T-0 đến T+7 & Rollback)**:
-   - Định rõ mốc thời gian chuyển đổi từng phút từ T-0 (Freeze writes) tới T+6 (Enable writes). Thiết lập điều kiện kích hoạt Rollback tức thì nếu tỷ lệ lỗi Neon > 3% hoặc phát hiện lệch số dư ví.
+5. **Cạnh Tranh Mã Giảm Giá (Discount Concurrency)**:
+   - Atomic claim cho `max_uses` bằng `UPDATE discount_codes SET used_count = used_count + 1 WHERE id = $id AND used_count < max_uses RETURNING id`.
+   - Kiểm soát `per_user_limit` bằng row-locking trên `discount_code_redemptions`.
+6. **Chiến Lược Rollback Chuẩn Xác**:
+   - Bỏ quy trình rollback ghi đè Neon bằng backup SQLite cũ (vì gây mất mát các đơn hàng và giao dịch mới sau cutover).
+   - Rollback đúng: Application Rollback (revert code, vẫn giữ Neon DB) hoặc Neon Point-In-Time Recovery (PITR) nếu lỗi schema/migration.
+7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
