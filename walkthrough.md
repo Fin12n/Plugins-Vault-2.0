@@ -172,42 +172,38 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v8 (Final Blocker Fixes):
-1. **Wallet Ledger Idempotency cho Multiple Order Underpayments**:
-   - Chuyển reference của underpayment credit sang `ref_type = 'sepay_transaction'`, `ref_id = sepay_transactions.id`, `kind = 'order_partial_credit'`.
-   - Mỗi lần chuyển khoản thiếu cho cùng một đơn hàng sinh ra 1 ledger entry riêng biệt, hoàn toàn loại bỏ xung đột Partial Unique Index `(ref_type, ref_id, kind)`.
-   - Giữ trọn vẹn chuỗi truy vết: `sepay_transaction -> order -> wallet_ledger`.
-2. **SePay Duplicate / Retry Semantics Đa Trạng Thái**:
-   - Phân biệt rõ:
-     - **Case A**: Giao dịch đã đạt terminal state (`credited`, `refunded`, `duplicate_transfer`) -> Idempotent no-op.
-     - **Case B**: Giao dịch chưa hoàn tất (`received` do sập tiến trình) -> Khóa hàng `FOR UPDATE`, resume và reconcile an toàn, không credit đúp ví.
-     - **Case C**: Giao dịch `unmatched` và nay đơn hàng/phiếu nạp xuất hiện -> Khớp và chuyển terminal state.
-3. **Migration Checkpoint Status Atomicity**:
-   - Cập nhật trạng thái `status = 'completed'` của checkpoint ngay TRONG CÙNG TRANSACTION với batch dữ liệu nghiệp vụ.
-   - Sập trước commit -> rollback cả batch và checkpoint; Commit thành công -> cả dữ liệu và status `'completed'` cùng tồn tại bền vững.
-4. **Global Write Freeze Toàn Cục**:
-   - Đóng băng toàn bộ 7 business writers (Bot Discord, Dashboard mutations, Workers, Schedulers, Payment webhooks, Delivery workers, Background jobs).
-   - **Webhook Policy**: Trả mã **HTTP 503 Service Unavailable kèm `Retry-After: 60`** để cổng thanh toán SePay/Card2k tự động thử lại bằng exponential retry, tuyệt đối không làm rơi rớt tiền và giao dịch của khách.
-5. **Partial Payment Business Model (Direct Wallet Credit)**:
-   - Áp dụng mô hình credit 100% tiền thực nhận vào ví khách hàng; giữ nguyên `orders.bank_due` và `orders.status = 'pending'`.
-   - Thông báo Discord minh bạch hướng dẫn khách dùng số dư ví để thanh toán đơn hàng hoặc chuyển khoản đủ chính xác `bank_due`; không bao giờ gây nhầm lẫn yêu cầu "bù phần còn lại" qua chuyển khoản ngân hàng.
-6. **Bộ Ràng Buộc Wallet Reconciliation Toàn Diện**:
-   - Invariant: `wallet.balance == SUM(wallet_ledger.delta)`.
-   - `opening_balance` chỉ xuất hiện tối đa 1 lần duy nhất (`idx_wallet_ledger_opening_balance`).
-   - Mọi biến động số dư phải có ledger entry tương ứng.
-   - Phân loại rõ ràng taxonomy của ledger kind (`opening_balance`, `topup_credit`, `card_credit`, `order_debit`, `order_partial_credit`, `order_overpay_credit`, `order_refund`, `admin_adjustment`).
-7. **Bộ Kiểm Thử Acceptance Toàn Diện v8 (A -> I)**:
-   - **Test A**: Multiple Order Underpayments (Order 100k, nhận 40k + 60k, 2 ledger entries độc lập, 0 collision).
-   - **Test B**: Same SePay Retry After Process Crash (Crash khi received -> Resume an toàn, 0 duplicate credit).
-   - **Test C**: Unmatched SePay Late-Order Reconciliation (Unmatched -> Reconcile thành công khi order xuất hiện).
-   - **Test D**: Global Write Freeze Enforcement (7 writers gated, webhook trả 503, 0 mutation ngoài migration).
-   - **Test E**: SePay Wallet Topup Concurrency.
-   - **Test F**: Order Bank Payment Exact/Overpay Concurrency.
-   - **Test G**: Migration Crash / Resume Checkpoint.
-   - **Test H**: Download Token Concurrent Access & Compensation.
-   - **Test I**: Delivery Stale Recovery & Claim Token.
-8. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v9 (Last Corrections Before Implementation):
+1. **Fix SePay Status State Machine (Option B Alignment)**:
+   - Loại bỏ hoàn toàn trạng thái `refunded` khỏi bảng `sepay_transactions` và các câu lệnh kiểm tra retry/terminal.
+   - Thống nhất ranh giới nghiệp vụ: `sepay_transactions` là chứng từ kiểm toán bất biến ghi nhận tiền vào ngân hàng (`transfer_type = 'in'`). Nghiệp vụ hoàn tiền (Refund) thuộc độc quyền vòng đời đơn hàng (`orders.status = 'refunded'`) và sổ cái ví (`wallet_ledger.kind = 'order_refund'`).
+2. **Audit & Fix Global Lock Order (Zero Deadlock & No Lock Inversion)**:
+   - Canonical Lock Order: `1. discount_codes ➔ 2. wallets ➔ 3. orders ➔ 4. wallet_topups ➔ 5. delivery_jobs`.
+   - **Tối ưu hóa Exact Payment**: Chỉ khóa `orders (#3)`, không khóa `wallets (#2)` vì số dư ví không đổi, loại bỏ tranh chấp khóa với nạp ví/mua hàng.
+   - **Triệt tiêu Lock Inversion trong `refundOrderWallet`**: Pre-read `orders` không lock để lấy `discordUserId`, sau đó khóa `wallets (#2) FOR UPDATE` trước rồi mới khóa `orders (#3) FOR UPDATE`. Chiều khóa luôn là `wallets ➔ orders`, hoàn toàn khớp với `openOrder` và luồng thanh toán đơn hàng.
+   - Bổ sung kiểm thử deadlock concurrency cho 4 kịch bản đồng thời.
+3. **Xác Minh Thực Tế: Existing-Order Wallet Settlement Policy**:
+   - Kiểm tra toàn bộ codebase: Xác nhận **KHÔNG TỒN TẠI** API hay UI `settleExistingOrderWithWallet(orderId)`.
+   - Chuẩn hóa thông điệp Discord và chính sách thanh toán: Không hứa hẹn tính năng dùng ví trả nốt đơn pending. Hướng dẫn khách đúng 2 lựa chọn được hỗ trợ: (1) chuyển đủ chính xác `bank_due`, hoặc (2) chờ đơn hết hạn để tạo đơn mới (hệ thống sẽ tự động trừ số dư ví vào đơn mới).
+4. **Chuẩn Hóa Giả Định Provider Trong Payment Write Freeze**:
+   - **Cổng SePay**: Bổ sung Pre-cutover Checklist tại T-10m xác minh "Auto-Retry on 5xx" đang BẬT trên SePay Merchant Dashboard. Trả HTTP 503 `Retry-After: 60` trong cửa sổ freeze. Bổ sung Durable Ingress Buffer (`data/sepay_ingress_buffer.jsonl`) phòng ngừa sự cố mạng.
+   - **Cổng Card2k**: Xác minh mã nguồn ([scheduler.ts:555](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/maintenance/scheduler.ts#L555)) xác nhận Card2k **hoàn toàn không có webhook callback** (sử dụng Outbound Polling client). Khóa modal `/napthe` tại T-0, tạm dừng scheduler sweep, bảo toàn thẻ pending trong `card_topups`, và kích hoạt lại polling tại T+6 trên Neon với zero lost cards.
+5. **Bộ Kiểm Thử Acceptance Toàn Diện v9 (A ➔ M)**:
+   - **Test A: Status Consistency**: 0 business logic tham chiếu status không tồn tại (`sepay_transactions` không có `refunded`).
+   - **Test B: Global Lock Inversion & Deadlock Concurrency**: 0 deadlock khi chạy concurrent: purchase + bank payment, refund + bank payment, wallet topup + purchase, concurrent order payment.
+   - **Test C: Existing Order Wallet Settlement Policy**: Xử lý underpayment an toàn, thông báo không hứa hẹn capability chưa có.
+   - **Test D: Payment Freeze Provider Verification**: SePay 503 + retry configuration / ingress buffer; Card2k modal gate + scheduler pause/resume.
+   - **Test E**: Multiple Order Underpayments (Mỗi lần chuyển thiếu có 1 ledger entry riêng biệt, 0 unique collision).
+   - **Test F**: Same SePay Retry After Process Crash (Crash khi received -> Resume an toàn, 0 duplicate credit).
+   - **Test G**: Unmatched SePay Late-Order Reconciliation (Unmatched -> Reconcile thành công khi order xuất hiện).
+   - **Test H**: Global Write Freeze Enforcement (7 writers gated, webhook trả 503, 0 mutation ngoài migration).
+   - **Test I**: SePay Wallet Topup Concurrency.
+   - **Test J**: Order Bank Payment Exact/Overpay Concurrency.
+   - **Test K**: Migration Crash / Resume Checkpoint.
+   - **Test L**: Download Token Concurrent Access & Compensation.
+   - **Test M**: Delivery Stale Recovery & Claim Token.
+6. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
 > 📝 **Cam kết thực thi**: Báo cáo Walkthrough này sẽ tiếp tục được tự động cập nhật và xuất bản sau mỗi giai đoạn triển khai PLAN tiếp theo của dự án.
+
