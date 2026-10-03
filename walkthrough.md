@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v5: Delivery Semantics, Job Uniqueness & SePay Traceability)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v6: Resumable Checkpoints, UUID Account Bridge & Global Lock Order)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,24 +172,22 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v5:
-1. **Phân Định Ngữ Nghĩa Delivery (Delivery Semantics)**:
-   - Phân biệt rõ: **Database Delivery State = Idempotent** (thông qua `delivery_jobs` + `delivery_logs`) vs **External Discord Delivery = At-Least-Once** (do Discord DM API không có dedupe ID).
-   - Thiết lập **Worker Crash Recovery Policy**: Khi crash sau khi send thành công nhưng chưa commit log, recovery worker kiểm tra `external_attempt_count >= 1`, tránh spam lại tệp đính kèm lặp qua DM, tự động cấp link tải dự phòng và hoàn tất ghi log.
-2. **Delivery Job Uniqueness**:
-   - Ràng buộc Unique `(order_id, delivery_method)` trên `delivery_jobs`. Đảm bảo 1 order + 1 method = đúng 1 active delivery intent, mọi retry đều tái sử dụng cùng job row.
-3. **Đồng Bộ Vòng Đời Expired Topup (Reconciliation Lifecycle)**:
-   - Thống nhất schema với Payment Policy Matrix: Trạng thái `expired` không phải terminal. Nếu khách chuyển tiền muộn sau khi hết hạn, hệ thống chuyển hợp lệ `expired -> credited`, nạp tiền ví an toàn, không để tiền bị kẹt.
-4. **Chuẩn Hóa SePay Status & Relational Traceability**:
-   - Bổ sung trường `status` tường minh (`received`, `matched`, `credited`, `underpaid`, `overpaid`, `duplicate_transfer`, `unmatched`) và khóa ngoại `order_id`, `topup_id`, `processed_at` trên `sepay_transactions`.
-5. **Quyết Định Migration: 100% Natural Business Key Mapping (Option B)**:
-   - Loại bỏ hoàn toàn Empty Migration Mode không an toàn. Mọi dữ liệu SQLite đều được ánh xạ qua Natural Keys (`slug`, `sha256`, `code`), kiểm tra đối chiếu an toàn trước khi insert.
-6. **Bổ Sung 4 Acceptance Test Cases v5**:
-   - Delivery crash after external send (kiểm soát duplicate external delivery).
-   - Duplicate delivery job (unique constraint `order_id, delivery_method`).
-   - Expired topup paid later (chuyển trạng thái `expired -> credited`).
-   - Neon partially populated (tự động chạy Option B thay vì Empty Mode).
-7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v6 (Final Blocker Corrections):
+1. **Idempotent & Resumable Migration (`migration_checkpoints`)**:
+   - Migration an toàn tuyệt đối trước mọi sự cố crash/mất mạng giữa chừng (ví dụ 50%). Khi chạy lại, script tự động resume từ checkpoint, không sinh duplicate rows hay hỏng khóa ngoại.
+2. **Spigot Account UUID Identity Bridge**:
+   - Loại bỏ hoàn toàn việc dùng `label` làm định danh khóa chính. Cố định `account_id` dạng UUID v4 bất biến giữa Local SQLite (`vault_secrets.db`) và Neon (`spigot_account_refs`). Đổi `label` không làm đứt gãy liên kết tài khoản.
+3. **Phân Định Rõ Ràng Delivery Intent vs Delivery Outcome**:
+   - `delivery_jobs` lưu `requestedMethod` (ví dụ `attachment`).
+   - `delivery_logs` lưu cả `requestedMethod` và `actualMethod`. Khi crash recovery kích hoạt, ghi nhận chính xác `requestedMethod = 'attachment'`, `actualMethod = 'fallback_link'`, tuyệt đối không ghi nhận fallback link dưới danh nghĩa attachment.
+4. **Thứ Tự Khóa Chuẩn Hóa Toàn Cục (Canonical Database Lock Order)**:
+   - Áp dụng thứ tự khóa thống nhất trên toàn bộ repository: `1. discount_codes -> 2. wallets -> 3. orders -> 4. wallet_topups -> 5. delivery_jobs`. Triệt tiêu hoàn toàn Lock Inversion và loại bỏ rủi ro Deadlock.
+5. **Bộ Kiểm Thử Acceptance Toàn Diện v6**:
+   - Migration Crash / Resume Test (crash 50% rồi tiếp tục thành công).
+   - Account Identity Bridge Test (thay đổi `label` giữ nguyên `account_id`).
+   - Delivery Outcome Accuracy Test (`requested = attachment`, `actual = fallback_link`).
+   - Global Lock Order Deadlock Freedom Test (chạy đồng thời 2 luồng không deadlock).
+6. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
