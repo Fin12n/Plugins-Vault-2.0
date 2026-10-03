@@ -163,33 +163,33 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v3: Topup Idempotency & Unified Transaction)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v4: Production-Safety & Durable Delivery)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
   ```text
-  LOCAL DATABASE  = SECRET / PRIVATE ACCOUNT VAULT (Cô lập credential, cookie, crawler)
-  NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng)
+  LOCAL DATABASE  = SECRET / PRIVATE ACCOUNT VAULT (Cô lập credential, cookie, crawler, master key ngoài DB)
+  NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Cuối Cùng (Final Architecture Corrections v3):
-1. **Wallet Topup Idempotency & DB Uniqueness**:
-   - Webhook SePay chỉ được cộng tiền ví và ghi ledger khi câu lệnh `UPDATE wallet_topups SET status = 'credited' ... WHERE status = 'pending' RETURNING id` trả về **ĐÚNG 1 DÒNG**.
-   - Bổ sung ràng buộc cơ sở dữ liệu `UNIQUE (ref_type, ref_id, kind)` trên `wallet_ledger` ngăn chặn hoàn toàn nguy cơ nạp đúp tiền ở tầng database.
-2. **Discount Concurrency qua Khóa Hàng Cha (Parent Row-Locking)**:
-   - Loại bỏ `SELECT COUNT(*) FOR UPDATE` không hợp lệ.
-   - Sử dụng `SELECT * FROM discount_codes WHERE id = $id FOR UPDATE` để serialize tuần tự mọi lượt áp dụng mã giảm giá, kiểm soát chính xác `per_user_limit` và `max_uses`.
-3. **Purchase + Discount = ONE TRANSACTION BOUNDARY**:
-   - Toàn bộ thao tác: Lock mã giảm giá, tính giá cuối, lock ví, tạo đơn hàng, trừ tiền ví, ghi nhận mã giảm giá và tăng `used_count` đều nằm trong **CÙNG MỘT TRANSACTION DUY NHẤT**. Nếu đơn hàng lỗi, toàn bộ mã giảm giá và số dư ví tự động rollback sạch sẽ.
-4. **Bổ Sung 3 Acceptance Test Cases**:
-   - Duplicate Topup (2 webhook khác `sepay_id` cùng `topup.code`).
-   - Concurrent First Redemption (2 purchase đồng thời cùng user cho mã `per_user_limit = 1`).
-   - Purchase Failure After Discount Validation (Simulate DB failure -> Rollback toàn diện).
-5. **Ranh Giới Bảo Mật Tuyệt Đối (Secret Vault Isolation)**:
-   - Toàn bộ mật khẩu, cookie, session Spigot giữ tại Local SQLite (`data/vault_secrets.db`). Neon chỉ lưu tham chiếu phi nhạy cảm `spigot_account_refs`.
-6. **Chiến Lược Rollback Không Mất Dữ Liệu**:
-   - Cấm rollback bằng cách ghi đè DB từ backup SQLite cũ. Áp dụng Application Rollback (cùng Neon DB) hoặc Neon PITR.
-7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất (Final Production-Safety Corrections v4):
+1. **Partial Unique Index trên `wallet_ledger`**:
+   - Sử dụng `CREATE UNIQUE INDEX ... ON wallet_ledger (ref_type, ref_id, kind) WHERE ref_type != '' AND ref_id IS NOT NULL` (hoặc `uniqueIndex().where()` trong Drizzle) thay cho cú pháp table constraint không hợp lệ trong PostgreSQL.
+2. **Durable Delivery Handoff (Chống mất delivery intent khi crash)**:
+   - Thay thế mô hình fire-and-forget `async deliverVersion()`. Tạo `delivery_jobs` (trạng thái `queued`) trong **CÙNG TRANSACTION** với đơn hàng. Worker độc lập claim job và thực thi bàn giao sau `COMMIT`.
+3. **Chính Sách Số Tiền Thanh Toán Tường Minh (Payment Amount Policy Matrix)**:
+   - Định nghĩa chính xác hành vi cho 6 trạng thái: `EXACT`, `UNDERPAYMENT`, `OVERPAYMENT`, `UNKNOWN TOPUP CODE`, `EXPIRED TOPUP`, `DUPLICATE TOPUP CODE`. Tuyệt đối không suy đoán ngầm.
+4. **Download Token Atomic Consumption**:
+   - Tiêu thụ token bằng atomic mutation: `UPDATE download_tokens SET used_at = now() WHERE token_hash = $hash AND used_at IS NULL AND expires_at > now() RETURNING ...`. Chỉ 1 request nhận row mới được tải file.
+5. **Idempotency cho `delivery_logs`**:
+   - Bổ sung `delivery_idempotency_key` (Unique Index) dạng `${orderId}:${deliveryMethod}`, retry không bao giờ ghi trùng lặp bản ghi bàn giao thành công.
+6. **Master Encryption Key Policy**:
+   - Khóa `VAULT_MASTER_KEY` (32 bytes AES-256-GCM) được nạp từ biến môi trường/secret store bên ngoài database; hỗ trợ xoay khóa; fail-fast lập tức nếu thiếu khóa khi khởi động.
+7. **Foreign Key ID Mapping & Opening Balance Reconstruction**:
+   - Migration ánh xạ ID integer cũ sang Neon qua Natural Business Keys (`slug`, `sha256`, `code`). Tự động kiểm tra tính đầy đủ của sổ cái SQLite và chỉ tạo đúng 1 dòng `opening_balance` khi thật sự thiếu.
+8. **Secret Migration Hygiene**:
+   - Toàn bộ artifacts SQLite cũ (`deps.db`, `wal`, `shm`, backup dumps) được bảo mật nghiêm ngặt (`chmod 600`), cấm commit Git, cấm đưa lên Neon và ẩn toàn bộ credentials trong log.
+9. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
