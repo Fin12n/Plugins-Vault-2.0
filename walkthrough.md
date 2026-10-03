@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v7: Pre-Read Lock Order, Batch Atomicity & Lease Recovery)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v8: Final Blocker Fixes Before Implementation)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,25 +172,40 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v7 (Final Implementation Clarifications):
-1. **SePay Pre-Read & Canonical Lock Order**:
-   - Webhook SePay bắt buộc thực hiện Pre-Read KHÔNG LOCK (`WITHOUT FOR UPDATE`) để xác định `discordUserId` trước khi xin khóa hàng. Sau đó toàn bộ transaction tuân thủ Canonical Lock Order: `wallets -> orders -> wallet_topups`.
-2. **Đặc Tả Đầy Đủ Transaction Order Bank Payment**:
-   - Xây dựng đặc tả chi tiết trong 1 transaction duy nhất cho cả 3 trường hợp: **Exact** (hoàn tất đơn + tạo delivery job), **Underpayment** (không giao hàng, nạp số tiền thực nhận vào ví khách), **Overpayment** (hoàn tất đơn, cộng phần tiền thừa vào ví khách + tạo delivery job). Toàn bộ side effects (DM, HTTP 200, delivery) nằm ngoài DB transaction.
-3. **Migration Batch Checkpoint Atomicity**:
-   - Dữ liệu nghiệp vụ và checkpoint của cùng một batch (chunk) bắt buộc phải commit cùng nhau trong 1 transaction. Crash trước commit -> batch tự động chạy lại sạch sẽ mà không lệch checkpoint.
-4. **Chuẩn Hóa Natural Key Phiên Bản Plugin**:
-   - Business identity của version là `(plugin_id, version)` kèm unique index `idx_versions_plugin_version`. SHA256 chỉ dùng để audit và kiểm tra toàn vẹn file.
-5. **Download Token Authorization & Failure Compensation Policy**:
-   - Quy trình endpoint `/download/:token` chặt chẽ. Nếu file trên ổ cứng bị thiếu trước khi stream: Tự động bồi hoàn unclaim token (`used_at = NULL`), trả HTTP 503 và bảo lưu quyền tải cho khách.
-6. **Delivery Job Lease & Stale Recovery**:
-   - Cung cấp cơ chế Lease 5 phút với `claimToken`. Worker crash đột ngột sẽ được worker khác reclaim an toàn, không sinh duplicate delivery intent.
-7. **Bộ Kiểm Thử Acceptance Toàn Diện v7 (A -> E)**:
-   - SePay wallet topup concurrency (1 credit, 1 ledger).
-   - Order bank payment concurrency (không double payment/ledger/job).
-   - Migration crash/resume (atomic batch checkpoint).
-   - Download token concurrent access (tối đa 1 claim thành công).
-   - Delivery stale recovery (reclaim tự động khi worker crash).
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v8 (Final Blocker Fixes):
+1. **Wallet Ledger Idempotency cho Multiple Order Underpayments**:
+   - Chuyển reference của underpayment credit sang `ref_type = 'sepay_transaction'`, `ref_id = sepay_transactions.id`, `kind = 'order_partial_credit'`.
+   - Mỗi lần chuyển khoản thiếu cho cùng một đơn hàng sinh ra 1 ledger entry riêng biệt, hoàn toàn loại bỏ xung đột Partial Unique Index `(ref_type, ref_id, kind)`.
+   - Giữ trọn vẹn chuỗi truy vết: `sepay_transaction -> order -> wallet_ledger`.
+2. **SePay Duplicate / Retry Semantics Đa Trạng Thái**:
+   - Phân biệt rõ:
+     - **Case A**: Giao dịch đã đạt terminal state (`credited`, `refunded`, `duplicate_transfer`) -> Idempotent no-op.
+     - **Case B**: Giao dịch chưa hoàn tất (`received` do sập tiến trình) -> Khóa hàng `FOR UPDATE`, resume và reconcile an toàn, không credit đúp ví.
+     - **Case C**: Giao dịch `unmatched` và nay đơn hàng/phiếu nạp xuất hiện -> Khớp và chuyển terminal state.
+3. **Migration Checkpoint Status Atomicity**:
+   - Cập nhật trạng thái `status = 'completed'` của checkpoint ngay TRONG CÙNG TRANSACTION với batch dữ liệu nghiệp vụ.
+   - Sập trước commit -> rollback cả batch và checkpoint; Commit thành công -> cả dữ liệu và status `'completed'` cùng tồn tại bền vững.
+4. **Global Write Freeze Toàn Cục**:
+   - Đóng băng toàn bộ 7 business writers (Bot Discord, Dashboard mutations, Workers, Schedulers, Payment webhooks, Delivery workers, Background jobs).
+   - **Webhook Policy**: Trả mã **HTTP 503 Service Unavailable kèm `Retry-After: 60`** để cổng thanh toán SePay/Card2k tự động thử lại bằng exponential retry, tuyệt đối không làm rơi rớt tiền và giao dịch của khách.
+5. **Partial Payment Business Model (Direct Wallet Credit)**:
+   - Áp dụng mô hình credit 100% tiền thực nhận vào ví khách hàng; giữ nguyên `orders.bank_due` và `orders.status = 'pending'`.
+   - Thông báo Discord minh bạch hướng dẫn khách dùng số dư ví để thanh toán đơn hàng hoặc chuyển khoản đủ chính xác `bank_due`; không bao giờ gây nhầm lẫn yêu cầu "bù phần còn lại" qua chuyển khoản ngân hàng.
+6. **Bộ Ràng Buộc Wallet Reconciliation Toàn Diện**:
+   - Invariant: `wallet.balance == SUM(wallet_ledger.delta)`.
+   - `opening_balance` chỉ xuất hiện tối đa 1 lần duy nhất (`idx_wallet_ledger_opening_balance`).
+   - Mọi biến động số dư phải có ledger entry tương ứng.
+   - Phân loại rõ ràng taxonomy của ledger kind (`opening_balance`, `topup_credit`, `card_credit`, `order_debit`, `order_partial_credit`, `order_overpay_credit`, `order_refund`, `admin_adjustment`).
+7. **Bộ Kiểm Thử Acceptance Toàn Diện v8 (A -> I)**:
+   - **Test A**: Multiple Order Underpayments (Order 100k, nhận 40k + 60k, 2 ledger entries độc lập, 0 collision).
+   - **Test B**: Same SePay Retry After Process Crash (Crash khi received -> Resume an toàn, 0 duplicate credit).
+   - **Test C**: Unmatched SePay Late-Order Reconciliation (Unmatched -> Reconcile thành công khi order xuất hiện).
+   - **Test D**: Global Write Freeze Enforcement (7 writers gated, webhook trả 503, 0 mutation ngoài migration).
+   - **Test E**: SePay Wallet Topup Concurrency.
+   - **Test F**: Order Bank Payment Exact/Overpay Concurrency.
+   - **Test G**: Migration Crash / Resume Checkpoint.
+   - **Test H**: Download Token Concurrent Access & Compensation.
+   - **Test I**: Delivery Stale Recovery & Claim Token.
 8. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
