@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v8: Final Blocker Fixes Before Implementation)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v10: Final Implementation Gate)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,38 +172,56 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v9 (Last Corrections Before Implementation):
-1. **Fix SePay Status State Machine (Option B Alignment)**:
-   - Loại bỏ hoàn toàn trạng thái `refunded` khỏi bảng `sepay_transactions` và các câu lệnh kiểm tra retry/terminal.
-   - Thống nhất ranh giới nghiệp vụ: `sepay_transactions` là chứng từ kiểm toán bất biến ghi nhận tiền vào ngân hàng (`transfer_type = 'in'`). Nghiệp vụ hoàn tiền (Refund) thuộc độc quyền vòng đời đơn hàng (`orders.status = 'refunded'`) và sổ cái ví (`wallet_ledger.kind = 'order_refund'`).
-2. **Audit & Fix Global Lock Order (Zero Deadlock & No Lock Inversion)**:
-   - Canonical Lock Order: `1. discount_codes ➔ 2. wallets ➔ 3. orders ➔ 4. wallet_topups ➔ 5. delivery_jobs`.
-   - **Tối ưu hóa Exact Payment**: Chỉ khóa `orders (#3)`, không khóa `wallets (#2)` vì số dư ví không đổi, loại bỏ tranh chấp khóa với nạp ví/mua hàng.
-   - **Triệt tiêu Lock Inversion trong `refundOrderWallet`**: Pre-read `orders` không lock để lấy `discordUserId`, sau đó khóa `wallets (#2) FOR UPDATE` trước rồi mới khóa `orders (#3) FOR UPDATE`. Chiều khóa luôn là `wallets ➔ orders`, hoàn toàn khớp với `openOrder` và luồng thanh toán đơn hàng.
-   - Bổ sung kiểm thử deadlock concurrency cho 4 kịch bản đồng thời.
-3. **Xác Minh Thực Tế: Existing-Order Wallet Settlement Policy**:
-   - Kiểm tra toàn bộ codebase: Xác nhận **KHÔNG TỒN TẠI** API hay UI `settleExistingOrderWithWallet(orderId)`.
-   - Chuẩn hóa thông điệp Discord và chính sách thanh toán: Không hứa hẹn tính năng dùng ví trả nốt đơn pending. Hướng dẫn khách đúng 2 lựa chọn được hỗ trợ: (1) chuyển đủ chính xác `bank_due`, hoặc (2) chờ đơn hết hạn để tạo đơn mới (hệ thống sẽ tự động trừ số dư ví vào đơn mới).
-4. **Chuẩn Hóa Giả Định Provider Trong Payment Write Freeze**:
-   - **Cổng SePay**: Bổ sung Pre-cutover Checklist tại T-10m xác minh "Auto-Retry on 5xx" đang BẬT trên SePay Merchant Dashboard. Trả HTTP 503 `Retry-After: 60` trong cửa sổ freeze. Bổ sung Durable Ingress Buffer (`data/sepay_ingress_buffer.jsonl`) phòng ngừa sự cố mạng.
-   - **Cổng Card2k**: Xác minh mã nguồn ([scheduler.ts:555](file:///e:/Codebase/Plugins%20Vault%20v2.0/discord/src/services/maintenance/scheduler.ts#L555)) xác nhận Card2k **hoàn toàn không có webhook callback** (sử dụng Outbound Polling client). Khóa modal `/napthe` tại T-0, tạm dừng scheduler sweep, bảo toàn thẻ pending trong `card_topups`, và kích hoạt lại polling tại T+6 trên Neon với zero lost cards.
-5. **Bộ Kiểm Thử Acceptance Toàn Diện v9 (A ➔ M)**:
-   - **Test A: Status Consistency**: 0 business logic tham chiếu status không tồn tại (`sepay_transactions` không có `refunded`).
-   - **Test B: Global Lock Inversion & Deadlock Concurrency**: 0 deadlock khi chạy concurrent: purchase + bank payment, refund + bank payment, wallet topup + purchase, concurrent order payment.
-   - **Test C: Existing Order Wallet Settlement Policy**: Xử lý underpayment an toàn, thông báo không hứa hẹn capability chưa có.
-   - **Test D: Payment Freeze Provider Verification**: SePay 503 + retry configuration / ingress buffer; Card2k modal gate + scheduler pause/resume.
-   - **Test E**: Multiple Order Underpayments (Mỗi lần chuyển thiếu có 1 ledger entry riêng biệt, 0 unique collision).
-   - **Test F**: Same SePay Retry After Process Crash (Crash khi received -> Resume an toàn, 0 duplicate credit).
-   - **Test G**: Unmatched SePay Late-Order Reconciliation (Unmatched -> Reconcile thành công khi order xuất hiện).
-   - **Test H**: Global Write Freeze Enforcement (7 writers gated, webhook trả 503, 0 mutation ngoài migration).
-   - **Test I**: SePay Wallet Topup Concurrency.
-   - **Test J**: Order Bank Payment Exact/Overpay Concurrency.
-   - **Test K**: Migration Crash / Resume Checkpoint.
-   - **Test L**: Download Token Concurrent Access & Compensation.
-   - **Test M**: Delivery Stale Recovery & Claim Token.
-6. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v10 (Final Implementation Gate):
+1. **Wallet Topup Amount Policy (Dynamic Real-Amount Credit)**:
+   - Thống nhất chính sách nạp ví: Luôn credit đúng số tiền thực nhận (`receivedAmount > 0`), không phụ thuộc vào số tiền yêu cầu ban đầu (`requestedAmount`).
+   - Quy tắc hạch toán: `wallets.balance += receivedAmount`, `wallet_ledger delta = receivedAmount`, `wallet_topups.paidAmount = receivedAmount`, `wallet_topups.status = 'credited'`, `sepay_transactions.status = 'credited'`.
+   - Áp dụng hoàn toàn giống nhau cho cả phiếu nạp ở trạng thái `pending` và `expired` (tiền về muộn). Tiền của khách không bao giờ bị kẹt.
+2. **SePay Transaction Relation Invariant & Exclusivity Constraint**:
+   - Xác lập tính loại trừ tương hỗ tuyệt đối giữa Order và Topup qua database constraint:
+     ```sql
+     CONSTRAINT chk_sepay_target_exclusivity CHECK (
+       (order_id IS NULL AND topup_id IS NULL) OR
+       (order_id IS NOT NULL AND topup_id IS NULL) OR
+       (order_id IS NULL AND topup_id IS NOT NULL)
+     );
+     ```
+   - UNMATCHED: `order_id IS NULL AND topup_id IS NULL`.
+   - ORDER PAYMENT: `order_id IS NOT NULL AND topup_id IS NULL`.
+   - WALLET TOPUP: `order_id IS NULL AND topup_id IS NOT NULL`.
+   - Giao dịch lặp lại (`duplicate_transfer`) bắt buộc bảo toàn đúng reference đến business object gốc đã sinh ra nó.
+3. **Chuẩn Hóa Thuật Ngữ "Serializable Consistency" (Option A - Lock-Based Consistency)**:
+   - Loại bỏ hoàn toàn việc claim PostgreSQL SERIALIZABLE isolation (tránh gây nhầm lẫn về việc cần retry SQLSTATE 40001 serialization_failure).
+   - Chuẩn hóa thành: **“Lock-based transactional consistency for defined business invariants”**.
+   - Cơ chế bảo vệ: Read Committed mặc định + pessimistic row locking (`FOR UPDATE`) + Partial Unique Indexes (`wallet_ledger`, `delivery_jobs`) + Canonical Lock Order (1 ➔ 5) + Atomic DB Transactions.
+4. **Migration Dependency Graph & 16-Step DAG (Foreign-Key Ordered Execution)**:
+   - Migration không chạy theo thứ tự file ngẫu nhiên mà tuân thủ nghiêm ngặt đồ thị phụ thuộc khóa ngoại (Parent ➔ Child):
+     `users/staffs/channels ➔ spigot_account_refs (UUID) ➔ plugins ➔ versions ➔ wallets ➔ discount_codes ➔ wallet_topups ➔ card_topups ➔ orders ➔ discount_redemptions ➔ sepay_transactions ➔ wallet_ledger ➔ resource_ownership ➔ download_tokens/delivery_jobs/logs ➔ upstream ➔ final reconciliation & sequence reset`.
+   - Bắt buộc hoàn tất `In-Memory ID Mapping (sqlite_id ➔ neon_id)` của bảng cha trước khi di chuyển bảng con phụ thuộc.
+   - Thử nghiệm an toàn khi chạy lại trên Neon database đã có sẵn dữ liệu một phần (partially populated Neon tables).
+5. **Spigot Account Secret Boundary Tuyệt Đối (Zero Secret Leak)**:
+   - Local Vault (`vault_secrets.db`): Lưu `account_id` (UUID v4), `encrypted_password`, `encrypted_cookies` (xf), session, browser profile, crawler rate-limits.
+   - Neon Cloud DB (`spigot_account_refs`): CHỈ lưu `account_id` (UUID v4 PK), `label`, `status`, `health`, `last_verified_at`.
+   - Migration tuyệt đối KHÔNG copy: password, cookies, sessions, browser profile hay upstream auth tokens lên Neon.
+6. **Bộ Kiểm Thử Acceptance Toàn Diện v10 (Tests A ➔ N)**:
+   - **Test A**: Wallet Topup Amount Policy Test (Dynamic real-amount credit 50k / 100k / 150k against 100k requested topup; pending & expired).
+   - **Test B**: SePay Relation Integrity & Target Exclusivity Test (`chk_sepay_target_exclusivity`, duplicate transfer preserves original business ref).
+   - **Test C**: Lock-Based Transactional Consistency & Concurrency Isolation Test (Option A - Read Committed + row locking `FOR UPDATE` + Canonical Lock Order 1->5; 0 deadlock).
+   - **Test D**: Migration Dependency DAG & Resumability Test (Partially populated Neon tables; parent/child FK mapping; 0 orphan FKs, 0 duplicate rows).
+   - **Test E**: Spigot Account Secret Boundary Test (Neon scan contains 0 secrets; local vault retains encrypted credentials).
+   - **Test F**: Status Consistency Test (Option B - `sepay_transactions` không có `refunded`).
+   - **Test G**: Global Lock Inversion & Concurrency Deadlock Test.
+   - **Test H**: Existing Order Wallet Settlement Policy & Notification Test.
+   - **Test I**: Payment Freeze & Provider Verification Test (SePay retry checklist/buffer; Card2k outbound polling client).
+   - **Test J**: Multiple Order Underpayments Test (Financial event isolation qua `sepay_transactions.id`).
+   - **Test K**: Same SePay Retry After Process Crash Test (Non-terminal resume, 0 duplicate credit).
+   - **Test L**: Unmatched SePay Late-Order Reconciliation Test.
+   - **Test M**: Global Write Freeze Enforcement Test (7 business writers gated).
+   - **Test N**: Concurrency, Token Compensation & Delivery Stale Lease Recovery Test.
+7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
 > 📝 **Cam kết thực thi**: Báo cáo Walkthrough này sẽ tiếp tục được tự động cập nhật và xuất bản sau mỗi giai đoạn triển khai PLAN tiếp theo của dự án.
+
 
