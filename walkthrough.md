@@ -163,7 +163,7 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
 
 ---
 
-## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v4: Production-Safety & Durable Delivery)
+## 7. PLAN 5: Kế Hoạch Xác Lập Neon Database Authority - Phase 1 (Bản Chuẩn Hóa v5: Delivery Semantics, Job Uniqueness & SePay Traceability)
 
 - **Hồ sơ thiết kế chi tiết**: [`plans/2026-10-03-phase-1-neon-database-authority-plan.md`](file:///e:/Codebase/Plugins%20Vault%20v2.0/plans/2026-10-03-phase-1-neon-database-authority-plan.md)
 - **Tôn chỉ kiến trúc tối thượng**:
@@ -172,24 +172,24 @@ Chuyển đổi cấu hình kênh Discord tĩnh từ `.env` vào Database Neon P
   NEON POSTGRESQL = BUSINESS SINGLE SOURCE OF TRUTH (Toàn bộ giao dịch, tiền tệ, đơn hàng, durable delivery)
   ```
 
-### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất (Final Production-Safety Corrections v4):
-1. **Partial Unique Index trên `wallet_ledger`**:
-   - Sử dụng `CREATE UNIQUE INDEX ... ON wallet_ledger (ref_type, ref_id, kind) WHERE ref_type != '' AND ref_id IS NOT NULL` (hoặc `uniqueIndex().where()` trong Drizzle) thay cho cú pháp table constraint không hợp lệ trong PostgreSQL.
-2. **Durable Delivery Handoff (Chống mất delivery intent khi crash)**:
-   - Thay thế mô hình fire-and-forget `async deliverVersion()`. Tạo `delivery_jobs` (trạng thái `queued`) trong **CÙNG TRANSACTION** với đơn hàng. Worker độc lập claim job và thực thi bàn giao sau `COMMIT`.
-3. **Chính Sách Số Tiền Thanh Toán Tường Minh (Payment Amount Policy Matrix)**:
-   - Định nghĩa chính xác hành vi cho 6 trạng thái: `EXACT`, `UNDERPAYMENT`, `OVERPAYMENT`, `UNKNOWN TOPUP CODE`, `EXPIRED TOPUP`, `DUPLICATE TOPUP CODE`. Tuyệt đối không suy đoán ngầm.
-4. **Download Token Atomic Consumption**:
-   - Tiêu thụ token bằng atomic mutation: `UPDATE download_tokens SET used_at = now() WHERE token_hash = $hash AND used_at IS NULL AND expires_at > now() RETURNING ...`. Chỉ 1 request nhận row mới được tải file.
-5. **Idempotency cho `delivery_logs`**:
-   - Bổ sung `delivery_idempotency_key` (Unique Index) dạng `${orderId}:${deliveryMethod}`, retry không bao giờ ghi trùng lặp bản ghi bàn giao thành công.
-6. **Master Encryption Key Policy**:
-   - Khóa `VAULT_MASTER_KEY` (32 bytes AES-256-GCM) được nạp từ biến môi trường/secret store bên ngoài database; hỗ trợ xoay khóa; fail-fast lập tức nếu thiếu khóa khi khởi động.
-7. **Foreign Key ID Mapping & Opening Balance Reconstruction**:
-   - Migration ánh xạ ID integer cũ sang Neon qua Natural Business Keys (`slug`, `sha256`, `code`). Tự động kiểm tra tính đầy đủ của sổ cái SQLite và chỉ tạo đúng 1 dòng `opening_balance` khi thật sự thiếu.
-8. **Secret Migration Hygiene**:
-   - Toàn bộ artifacts SQLite cũ (`deps.db`, `wal`, `shm`, backup dumps) được bảo mật nghiêm ngặt (`chmod 600`), cấm commit Git, cấm đưa lên Neon và ẩn toàn bộ credentials trong log.
-9. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
+### 🔍 Kết Quả Chuẩn Hóa Kiến Trúc Sản Xuất v5:
+1. **Phân Định Ngữ Nghĩa Delivery (Delivery Semantics)**:
+   - Phân biệt rõ: **Database Delivery State = Idempotent** (thông qua `delivery_jobs` + `delivery_logs`) vs **External Discord Delivery = At-Least-Once** (do Discord DM API không có dedupe ID).
+   - Thiết lập **Worker Crash Recovery Policy**: Khi crash sau khi send thành công nhưng chưa commit log, recovery worker kiểm tra `external_attempt_count >= 1`, tránh spam lại tệp đính kèm lặp qua DM, tự động cấp link tải dự phòng và hoàn tất ghi log.
+2. **Delivery Job Uniqueness**:
+   - Ràng buộc Unique `(order_id, delivery_method)` trên `delivery_jobs`. Đảm bảo 1 order + 1 method = đúng 1 active delivery intent, mọi retry đều tái sử dụng cùng job row.
+3. **Đồng Bộ Vòng Đời Expired Topup (Reconciliation Lifecycle)**:
+   - Thống nhất schema với Payment Policy Matrix: Trạng thái `expired` không phải terminal. Nếu khách chuyển tiền muộn sau khi hết hạn, hệ thống chuyển hợp lệ `expired -> credited`, nạp tiền ví an toàn, không để tiền bị kẹt.
+4. **Chuẩn Hóa SePay Status & Relational Traceability**:
+   - Bổ sung trường `status` tường minh (`received`, `matched`, `credited`, `underpaid`, `overpaid`, `duplicate_transfer`, `unmatched`) và khóa ngoại `order_id`, `topup_id`, `processed_at` trên `sepay_transactions`.
+5. **Quyết Định Migration: 100% Natural Business Key Mapping (Option B)**:
+   - Loại bỏ hoàn toàn Empty Migration Mode không an toàn. Mọi dữ liệu SQLite đều được ánh xạ qua Natural Keys (`slug`, `sha256`, `code`), kiểm tra đối chiếu an toàn trước khi insert.
+6. **Bổ Sung 4 Acceptance Test Cases v5**:
+   - Delivery crash after external send (kiểm soát duplicate external delivery).
+   - Duplicate delivery job (unique constraint `order_id, delivery_method`).
+   - Expired topup paid later (chuyển trạng thái `expired -> credited`).
+   - Neon partially populated (tự động chạy Option B thay vì Empty Mode).
+7. **Trạng Thái Kế Hoạch**: **`READY FOR IMPLEMENTATION`**.
 
 ---
 
