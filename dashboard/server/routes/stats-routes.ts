@@ -44,7 +44,7 @@ export function registerStatsRoutes(app: FastifyInstance) {
     const [spigotHealthyRow] = await db
       .select({ val: count() })
       .from(spigotAccounts)
-      .where(and(eq(spigotAccounts.isEnabled, true), eq(spigotAccounts.status, 'ok')));
+      .where(and(eq(spigotAccounts.status, 'active'), eq(spigotAccounts.health, 'healthy')));
 
     // Đơn hàng gần đây (5 orders)
     const recentOrders = await db

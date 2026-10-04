@@ -8,10 +8,12 @@ import {
   boolean,
   timestamp,
   jsonb,
+  uuid,
+  check,
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 
 // ============================================================================
 // 1. PLUGINS & CATALOG
@@ -64,6 +66,7 @@ export const versions = pgTable(
     uploadedAt: timestamp("uploaded_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
+    uniqueIndex("idx_versions_plugin_version").on(table.pluginId, table.version),
     index("idx_versions_plugin_id").on(table.pluginId),
     index("idx_versions_plugin_uploaded").on(table.pluginId, table.uploadedAt),
     uniqueIndex("idx_versions_sha256").on(table.sha256),
@@ -111,10 +114,11 @@ export const orders = pgTable(
     bankDue: integer("bank_due").default(0).notNull(),
     paidAmount: integer("paid_amount"),
     status: varchar("status", { length: 20 }).default("pending").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    expiresAt: timestamp("expires_at").notNull(),
-    paidAt: timestamp("paid_at"),
-    deliveredAt: timestamp("delivered_at"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("idx_orders_status").on(table.status),
@@ -124,24 +128,57 @@ export const orders = pgTable(
   ]
 );
 
+export const walletTopups = pgTable(
+  "wallet_topups",
+  {
+    id: serial("id").primaryKey(),
+    code: varchar("code", { length: 32 }).unique().notNull(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
+    amount: integer("amount").notNull(), // requested amount
+    paidAmount: integer("paid_amount"), // real received amount
+    status: varchar("status", { length: 20 }).default("pending").notNull(), // pending | expired | credited
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    creditedAt: timestamp("credited_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("idx_wallet_topups_code").on(table.code),
+    index("idx_wallet_topups_status").on(table.status),
+    index("idx_wallet_topups_user").on(table.discordUserId, table.createdAt),
+  ]
+);
+
 export const sepayTransactions = pgTable(
   "sepay_transactions",
   {
     id: serial("id").primaryKey(),
     sepayId: integer("sepay_id").unique().notNull(),
-    orderId: integer("order_id").references(() => orders.id, {
-      onDelete: "set null",
-    }),
     amount: integer("amount").notNull(),
     transferType: varchar("transfer_type", { length: 10 }).notNull(),
     code: varchar("code", { length: 64 }),
     content: text("content").default("").notNull(),
+    description: text("description").default("").notNull(),
+    status: varchar("status", { length: 32 }).default("received").notNull(), // received | unmatched | credited | underpaid | overpaid | duplicate_transfer
+    orderId: integer("order_id").references(() => orders.id, {
+      onDelete: "set null",
+    }),
+    topupId: integer("topup_id").references(() => walletTopups.id, {
+      onDelete: "set null",
+    }),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
     rawPayload: jsonb("raw_payload").notNull(),
-    receivedAt: timestamp("received_at").defaultNow().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
-    index("idx_sepay_tx_sepay_id").on(table.sepayId),
+    check(
+      "chk_sepay_target_exclusivity",
+      sql`(order_id IS NULL AND topup_id IS NULL) OR (order_id IS NOT NULL AND topup_id IS NULL) OR (order_id IS NULL AND topup_id IS NOT NULL)`
+    ),
+    uniqueIndex("idx_sepay_tx_sepay_id").on(table.sepayId),
     index("idx_sepay_tx_code").on(table.code),
+    index("idx_sepay_tx_status").on(table.status),
+    index("idx_sepay_tx_order_id").on(table.orderId),
+    index("idx_sepay_tx_topup_id").on(table.topupId),
   ]
 );
 
@@ -151,8 +188,8 @@ export const sepayTransactions = pgTable(
 export const wallets = pgTable("wallets", {
   discordUserId: varchar("discord_user_id", { length: 32 }).primaryKey(),
   balance: integer("balance").default(0).notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const walletLedger = pgTable(
@@ -162,19 +199,25 @@ export const walletLedger = pgTable(
     discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
     delta: integer("delta").notNull(),
     balanceAfter: integer("balance_after").notNull(),
-    kind: varchar("kind", { length: 30 }).notNull(),
+    kind: varchar("kind", { length: 30 }).notNull(), // opening_balance | topup_credit | card_credit | order_debit | order_hold | order_partial_credit | order_overpay_credit | order_refund | admin_adjustment
     refType: varchar("ref_type", { length: 20 }).default("").notNull(),
     refId: integer("ref_id"),
     note: text("note").default("").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("idx_wallet_ledger_user").on(table.discordUserId, table.createdAt),
+    uniqueIndex("idx_wallet_ledger_ref_kind_unique")
+      .on(table.refType, table.refId, table.kind)
+      .where(sql`ref_type != '' AND ref_id IS NOT NULL`),
+    uniqueIndex("idx_wallet_ledger_opening_balance")
+      .on(table.discordUserId)
+      .where(sql`kind = 'opening_balance'`),
   ]
 );
 
 // ============================================================================
-// 4. DISCOUNTS
+// 4. DISCOUNTS & REDEMPTIONS
 // ============================================================================
 export const discountCodes = pgTable(
   "discount_codes",
@@ -187,9 +230,9 @@ export const discountCodes = pgTable(
     maxDiscount: integer("max_discount"),
     maxUses: integer("max_uses"),
     usedCount: integer("used_count").default(0).notNull(),
-    expiresAt: timestamp("expires_at"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
     isActive: boolean("is_active").default(true).notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("idx_discount_codes_code").on(table.code),
@@ -197,38 +240,151 @@ export const discountCodes = pgTable(
   ]
 );
 
-// ============================================================================
-// 5. SPIGOT ACCOUNTS & AUTOMATION STATE
-// ============================================================================
-export const spigotAccounts = pgTable(
-  "spigot_accounts",
+export const discountCodeRedemptions = pgTable(
+  "discount_code_redemptions",
   {
     id: serial("id").primaryKey(),
-    label: varchar("label", { length: 64 }).unique().notNull(),
-    username: varchar("username", { length: 128 }).notNull(),
-    passwordEncrypted: text("password_encrypted").notNull(),
-    xfUserEncrypted: text("xf_user_encrypted").default("").notNull(),
-    xfSessionEncrypted: text("xf_session_encrypted").default("").notNull(),
-    status: varchar("status", { length: 20 }).default("ok").notNull(),
-    isEnabled: boolean("is_enabled").default(true).notNull(),
-    lastVerifiedAt: timestamp("last_verified_at"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+    discountId: integer("discount_id")
+      .references(() => discountCodes.id, { onDelete: "cascade" })
+      .notNull(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
+    orderId: integer("order_id").references(() => orders.id, {
+      onDelete: "set null",
+    }),
+    discountAmount: integer("discount_amount").notNull(),
+    redeemedAt: timestamp("redeemed_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
-    index("idx_spigot_accounts_status").on(table.status),
-    index("idx_spigot_accounts_enabled").on(table.isEnabled),
+    uniqueIndex("idx_discount_redemptions_order").on(table.orderId),
+    index("idx_discount_redemptions_discount_user").on(
+      table.discountId,
+      table.discordUserId
+    ),
   ]
 );
+
+// ============================================================================
+// 5. DOWNLOAD TOKENS & DURABLE DELIVERY
+// ============================================================================
+export const downloadTokens = pgTable(
+  "download_tokens",
+  {
+    tokenHash: varchar("token_hash", { length: 64 }).primaryKey(), // sha256 hex
+    versionId: integer("version_id")
+      .references(() => versions.id, { onDelete: "cascade" })
+      .notNull(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
+    orderId: integer("order_id").references(() => orders.id, {
+      onDelete: "set null",
+    }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    failureReason: text("failure_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index("idx_download_tokens_expires").on(table.expiresAt),
+    index("idx_download_tokens_version").on(table.versionId),
+    index("idx_download_tokens_user").on(table.discordUserId),
+  ]
+);
+
+export const deliveryJobs = pgTable(
+  "delivery_jobs",
+  {
+    id: serial("id").primaryKey(),
+    orderId: integer("order_id")
+      .references(() => orders.id, { onDelete: "cascade" })
+      .notNull(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
+    versionId: integer("version_id")
+      .references(() => versions.id)
+      .notNull(),
+    requestedMethod: varchar("requested_method", { length: 32 })
+      .default("attachment")
+      .notNull(),
+    status: varchar("status", { length: 20 }).default("queued").notNull(), // queued | processing | delivered | failed
+    externalAttemptCount: integer("external_attempt_count").default(0).notNull(),
+    claimToken: varchar("claim_token", { length: 64 }),
+    lockedAt: timestamp("locked_at", { withTimezone: true }),
+    retryCount: integer("retry_count").default(0).notNull(),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_delivery_jobs_order_method").on(
+      table.orderId,
+      table.requestedMethod
+    ),
+    index("idx_delivery_jobs_status_locked").on(table.status, table.lockedAt),
+    index("idx_delivery_jobs_created").on(table.createdAt),
+  ]
+);
+
+export const deliveryLogs = pgTable(
+  "delivery_logs",
+  {
+    id: serial("id").primaryKey(),
+    deliveryIdempotencyKey: varchar("delivery_idempotency_key", { length: 128 })
+      .unique()
+      .notNull(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).notNull(),
+    versionId: integer("version_id")
+      .references(() => versions.id)
+      .notNull(),
+    orderId: integer("order_id").references(() => orders.id, {
+      onDelete: "set null",
+    }),
+    pluginName: varchar("plugin_name", { length: 255 }).notNull(),
+    versionLabel: varchar("version_label", { length: 64 }).default("").notNull(),
+    amount: integer("amount").default(0).notNull(),
+    requestedMethod: varchar("requested_method", { length: 32 }).notNull(), // attachment | link | manual
+    actualMethod: varchar("actual_method", { length: 32 }).notNull(), // attachment | fallback_link | manual
+    ip: varchar("ip", { length: 45 }),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_delivery_logs_idempotency").on(table.deliveryIdempotencyKey),
+    index("idx_delivery_logs_user").on(table.discordUserId, table.deliveredAt),
+    index("idx_delivery_logs_order").on(table.orderId),
+  ]
+);
+
+// ============================================================================
+// 6. SPIGOT PUBLIC ACCOUNT REFS (NON-SENSITIVE) & UPSTREAM STATE
+// ============================================================================
+export const spigotAccountRefs = pgTable(
+  "spigot_account_refs",
+  {
+    accountId: uuid("account_id").primaryKey().notNull(),
+    label: varchar("label", { length: 64 }).unique().notNull(),
+    status: varchar("status", { length: 20 }).default("active").notNull(),
+    health: varchar("health", { length: 20 }).default("healthy").notNull(),
+    lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_spigot_refs_label").on(table.label),
+    index("idx_spigot_refs_status").on(table.status),
+  ]
+);
+
+// Alias for backwards-compatibility
+export const spigotAccounts = spigotAccountRefs;
 
 export const resourceOwnership = pgTable(
   "resource_ownership",
   {
     id: serial("id").primaryKey(),
     resourceId: integer("resource_id").notNull(),
+    accountId: uuid("account_id"),
     accountLabel: varchar("account_label", { length: 64 }).notNull(),
     state: varchar("state", { length: 20 }).notNull(),
-    checkedAt: timestamp("checked_at").defaultNow().notNull(),
+    checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("idx_resource_ownership_pair").on(
@@ -236,6 +392,7 @@ export const resourceOwnership = pgTable(
       table.accountLabel
     ),
     index("idx_resource_ownership_state").on(table.resourceId, table.state),
+    index("idx_resource_ownership_account_id").on(table.accountId),
   ]
 );
 
@@ -246,7 +403,7 @@ export const upstreamState = pgTable("upstream_state", {
   versionUuid: varchar("version_uuid", { length: 64 }).notNull(),
   versionName: varchar("version_name", { length: 64 }).notNull(),
   releaseDateMs: text("release_date_ms").notNull(),
-  checkedAt: timestamp("checked_at").defaultNow().notNull(),
+  checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const pendingDownload = pgTable(
@@ -260,8 +417,8 @@ export const pendingDownload = pgTable(
     versionName: varchar("version_name", { length: 64 }).notNull(),
     attempts: integer("attempts").default(0).notNull(),
     lastError: text("last_error").default("").notNull(),
-    nextAttemptAt: timestamp("next_attempt_at").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("idx_pending_download_pair").on(
@@ -273,18 +430,18 @@ export const pendingDownload = pgTable(
 );
 
 // ============================================================================
-// 6. DISCORD CHANNELS & SYSTEM CONFIGURATION
+// 7. DISCORD CHANNELS & SYSTEM CONFIGURATION
 // ============================================================================
 export const discordChannels = pgTable(
   "discord_channels",
   {
     id: serial("id").primaryKey(),
     purpose: varchar("purpose", { length: 32 }).unique().notNull(), // 'notify' | 'orders' | 'audit' | 'panel'
-    channelId: varchar("channel_id", { length: 32 }).notNull(),     // Snowflake ID kênh
-    channelName: varchar("channel_name", { length: 100 }),          // Tên hiển thị (ví dụ: #bao-cao-loi)
-    guildId: varchar("guild_id", { length: 32 }),                   // Server Discord ID
-    isEnabled: boolean("is_enabled").default(true).notNull(),       // Bật/tắt thông báo vào kênh này
-    updatedBy: varchar("updated_by", { length: 32 }),               // Staff ID hoặc Discord User ID sửa
+    channelId: varchar("channel_id", { length: 32 }).notNull(),
+    channelName: varchar("channel_name", { length: 100 }),
+    guildId: varchar("guild_id", { length: 32 }),
+    isEnabled: boolean("is_enabled").default(true).notNull(),
+    updatedBy: varchar("updated_by", { length: 32 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -294,28 +451,22 @@ export const discordChannels = pgTable(
 );
 
 // ============================================================================
-// 7. STAFFS & PERMISSIONS (Decoupled Authentication Architecture)
+// 8. STAFFS & PERMISSIONS (Decoupled Authentication Architecture)
 // ============================================================================
 export const staffs = pgTable(
   "staffs",
   {
     id: serial("id").primaryKey(),
-    
-    // Nhận diện tài khoản & Ánh xạ đa nền tảng
-    email: varchar("email", { length: 255 }).unique(),                  // Khóa ánh xạ với Email từ Dashboard Auth DB
-    dashboardUserId: varchar("dashboard_user_id", { length: 64 }).unique(), // UUID / User ID từ Dashboard Auth DB (nếu có)
-    discordUserId: varchar("discord_user_id", { length: 32 }).unique(), // Snowflake ID của Staff trên Discord Bot
-    username: varchar("username", { length: 64 }).notNull(),             // Tên tài khoản hiển thị
-    displayName: varchar("display_name", { length: 100 }),               // Tên hiển thị thân thiện
-    avatarUrl: text("avatar_url"),                                       // Ảnh đại diện
-    
-    // Phân quyền & Vai trò (RBAC)
-    role: varchar("role", { length: 32 }).default("staff").notNull(),   // 'owner' | 'admin' | 'moderator' | 'support'
-    permissions: text("permissions").array().default([]).notNull(),      // Chi tiết quyền hạn
-    
-    // Trạng thái & Vết
-    isActive: boolean("is_active").default(true).notNull(),              // Khóa tài khoản tức thì khi cần
-    addedBy: varchar("added_by", { length: 32 }),                        // ID người tạo tài khoản
+    email: varchar("email", { length: 255 }).unique(),
+    dashboardUserId: varchar("dashboard_user_id", { length: 64 }).unique(),
+    discordUserId: varchar("discord_user_id", { length: 32 }).unique(),
+    username: varchar("username", { length: 64 }).notNull(),
+    displayName: varchar("display_name", { length: 100 }),
+    avatarUrl: text("avatar_url"),
+    role: varchar("role", { length: 32 }).default("staff").notNull(),
+    permissions: text("permissions").array().default([]).notNull(),
+    isActive: boolean("is_active").default(true).notNull(),
+    addedBy: varchar("added_by", { length: 32 }),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -330,7 +481,7 @@ export const staffs = pgTable(
 );
 
 // ============================================================================
-// 8. AUDIT LOGS (Nhật ký hành động hệ thống)
+// 9. AUDIT LOGS & SYSTEM
 // ============================================================================
 export const auditLogs = pgTable(
   "audit_logs",
@@ -338,10 +489,10 @@ export const auditLogs = pgTable(
     id: serial("id").primaryKey(),
     staffId: integer("staff_id").references(() => staffs.id, { onDelete: "set null" }),
     discordUserId: varchar("discord_user_id", { length: 32 }),
-    action: varchar("action", { length: 64 }).notNull(),                   // 'channel.update', 'plugin.price_set', 'staff.add', etc.
-    targetType: varchar("target_type", { length: 32 }), // 'channel', 'plugin', 'version', 'staff', 'wallet'
+    action: varchar("action", { length: 64 }).notNull(),
+    targetType: varchar("target_type", { length: 32 }),
     targetId: varchar("target_id", { length: 64 }),
-    details: jsonb("details").default({}).notNull(),   // Dữ liệu cũ và mới (diff)
+    details: jsonb("details").default({}).notNull(),
     ipAddress: varchar("ip_address", { length: 45 }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -393,9 +544,9 @@ export const cardTopups = pgTable(
     providerMessage: text("provider_message").default("").notNull(),
     transId: varchar("trans_id", { length: 64 }),
     attempts: integer("attempts").default(0).notNull(),
-    nextPollAt: timestamp("next_poll_at"),
-    creditedAt: timestamp("credited_at"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    nextPollAt: timestamp("next_poll_at", { withTimezone: true }),
+    creditedAt: timestamp("credited_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     index("idx_card_topups_poll").on(table.status, table.nextPollAt),
@@ -407,9 +558,24 @@ export const cardTopups = pgTable(
 export const config = pgTable("config", {
   key: varchar("key", { length: 64 }).primaryKey(),
   value: text("value").notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// ============================================================================
+// 10. MIGRATION CHECKPOINTS (Atomic Batch Progress)
+// ============================================================================
+export const migrationCheckpoints = pgTable(
+  "migration_checkpoints",
+  {
+    stepName: varchar("step_name", { length: 64 }).primaryKey(),
+    status: varchar("status", { length: 20 }).notNull(), // in_progress | completed | failed
+    lastProcessedKey: varchar("last_processed_key", { length: 128 }),
+    processedCount: integer("processed_count").default(0).notNull(),
+    checksum: varchar("checksum", { length: 64 }),
+    startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  }
+);
 
 // ============================================================================
 // RELATIONS DEFINITION
@@ -426,6 +592,9 @@ export const versionsRelations = relations(versions, ({ one, many }) => ({
   }),
   orders: many(orders),
   manualUploads: many(manualUploads),
+  deliveryJobs: many(deliveryJobs),
+  deliveryLogs: many(deliveryLogs),
+  downloadTokens: many(downloadTokens),
 }));
 
 export const manualUploadsRelations = relations(manualUploads, ({ one }) => ({
@@ -445,6 +614,14 @@ export const ordersRelations = relations(orders, ({ one, many }) => ({
     references: [versions.id],
   }),
   transactions: many(sepayTransactions),
+  deliveryJobs: many(deliveryJobs),
+  deliveryLogs: many(deliveryLogs),
+  downloadTokens: many(downloadTokens),
+  discountRedemptions: many(discountCodeRedemptions),
+}));
+
+export const walletTopupsRelations = relations(walletTopups, ({ many }) => ({
+  transactions: many(sepayTransactions),
 }));
 
 export const sepayTransactionsRelations = relations(
@@ -454,8 +631,63 @@ export const sepayTransactionsRelations = relations(
       fields: [sepayTransactions.orderId],
       references: [orders.id],
     }),
+    topup: one(walletTopups, {
+      fields: [sepayTransactions.topupId],
+      references: [walletTopups.id],
+    }),
   })
 );
+
+export const discountCodesRelations = relations(discountCodes, ({ many }) => ({
+  redemptions: many(discountCodeRedemptions),
+}));
+
+export const discountCodeRedemptionsRelations = relations(
+  discountCodeRedemptions,
+  ({ one }) => ({
+    discount: one(discountCodes, {
+      fields: [discountCodeRedemptions.discountId],
+      references: [discountCodes.id],
+    }),
+    order: one(orders, {
+      fields: [discountCodeRedemptions.orderId],
+      references: [orders.id],
+    }),
+  })
+);
+
+export const deliveryJobsRelations = relations(deliveryJobs, ({ one }) => ({
+  order: one(orders, {
+    fields: [deliveryJobs.orderId],
+    references: [orders.id],
+  }),
+  version: one(versions, {
+    fields: [deliveryJobs.versionId],
+    references: [versions.id],
+  }),
+}));
+
+export const deliveryLogsRelations = relations(deliveryLogs, ({ one }) => ({
+  order: one(orders, {
+    fields: [deliveryLogs.orderId],
+    references: [orders.id],
+  }),
+  version: one(versions, {
+    fields: [deliveryLogs.versionId],
+    references: [versions.id],
+  }),
+}));
+
+export const downloadTokensRelations = relations(downloadTokens, ({ one }) => ({
+  order: one(orders, {
+    fields: [downloadTokens.orderId],
+    references: [orders.id],
+  }),
+  version: one(versions, {
+    fields: [downloadTokens.versionId],
+    references: [versions.id],
+  }),
+}));
 
 export const staffsRelations = relations(staffs, ({ many }) => ({
   auditLogs: many(auditLogs),
@@ -467,4 +699,3 @@ export const auditLogsRelations = relations(auditLogs, ({ one }) => ({
     references: [staffs.id],
   }),
 }));
-

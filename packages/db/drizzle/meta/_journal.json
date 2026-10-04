@@ -22,6 +22,13 @@
       "when": 1790740254870,
       "tag": "0002_wide_cyclops",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791047513896,
+      "tag": "0003_phase_1_neon_authority",
+      "breakpoints": true
     }
   ]
 }

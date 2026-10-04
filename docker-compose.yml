@@ -35,6 +35,8 @@ services:
     container_name: vault-discord-bot
     restart: unless-stopped
     env_file: discord/.env
+    ports:
+      - "${BOT_PORT:-3001}:${PORT:-3000}"
     volumes:
       - ./data:/app/discord/data
       - ./vault:/app/discord/vault

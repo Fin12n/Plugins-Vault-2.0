@@ -19,6 +19,7 @@ import type { DeliveryDeps } from '../delivery/deliver-version.js';
 import { deliverVersion } from '../delivery/deliver-version.js';
 import { buildVietQrUrl, generatePaymentCode } from './build-vietqr-url.js';
 import { isCodeAvailable } from './open-wallet-topup.js';
+import { assertNotFrozen } from '../maintenance/write-freeze.js';
 
 export type OrderConfig = {
   accountNumber: string;
@@ -59,6 +60,7 @@ export function openOrder(
   config: OrderConfig,
   input: { discordUserId: string; versionId: number },
 ): CreatedOrder | null {
+  assertNotFrozen('Mở đơn hàng mới');
   const version = findVersionWithPlugin(db, input.versionId);
   if (!version) return null;
 

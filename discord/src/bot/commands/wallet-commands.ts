@@ -16,7 +16,9 @@ import { isCard2kConfigured } from '../../services/card/card2k-client.js';
 import { denominationsFor, TELCO_LABELS, TELCOS, type Telco } from '../../services/card/card2k-telcos.js';
 import { submitCardTopup, type SubmitRejection } from '../../services/card/submit-card-topup.js';
 import { getBalance, listLedger } from '../../repositories/wallets.js';
-import { openWalletTopup } from '../../services/payment/open-wallet-topup.js';
+import { getNeonDb } from '../../db/neon.js';
+import { getWalletBalance, listLedgerEntries } from '../../repositories/neon-wallets.js';
+import { openWalletTopup, openWalletTopupNeon } from '../../services/payment/open-wallet-topup.js';
 import { botVi, formatVnd } from '../i18n/bot-vi.js';
 import {
   createCardResultContainer,
@@ -79,8 +81,22 @@ export async function handleWalletCommand(
   }
   if (!(await requireAdminRole(interaction, deps))) return;
 
-  const balance = getBalance(deps.db, interaction.user.id);
-  const recent = listLedger(deps.db, interaction.user.id, 5);
+  const neonDb = getNeonDb();
+  let balance: number;
+  let recent: any[];
+  if (neonDb) {
+    balance = await getWalletBalance(neonDb, interaction.user.id);
+    const ledger = await listLedgerEntries(neonDb, interaction.user.id, 5);
+    recent = ledger.map((l) => ({
+      delta: l.delta,
+      kind: l.kind,
+      description: l.note || '',
+      createdAt: l.createdAt ? l.createdAt.toISOString() : new Date().toISOString(),
+    }));
+  } else {
+    balance = getBalance(deps.db, interaction.user.id);
+    recent = listLedger(deps.db, interaction.user.id, 5);
+  }
 
   const container = createWalletContainer(balance, recent);
   const payload = v2Payload(container, [topupRow(deps)], { ephemeral: true });
@@ -103,7 +119,12 @@ export async function handleTopupCommand(
   }
   if (!(await requireAdminRole(interaction, deps))) return;
 
-  const container = createWalletContainer(getBalance(deps.db, interaction.user.id), []);
+  const neonDb = getNeonDb();
+  const balance = neonDb
+    ? await getWalletBalance(neonDb, interaction.user.id)
+    : getBalance(deps.db, interaction.user.id);
+
+  const container = createWalletContainer(balance, []);
   const payload = v2Payload(container, [topupRow(deps)], { ephemeral: true });
 
   if (interaction.deferred || interaction.replied) {
@@ -279,10 +300,16 @@ export async function handleBankTopupModal(
     return;
   }
 
-  const topup = openWalletTopup(deps.db, deps.orders, {
-    discordUserId: interaction.user.id,
-    amount,
-  });
+  const neonDb = getNeonDb();
+  const topup = neonDb
+    ? await openWalletTopupNeon(neonDb, deps.orders, {
+        discordUserId: interaction.user.id,
+        amount,
+      })
+    : openWalletTopup(deps.db, deps.orders, {
+        discordUserId: interaction.user.id,
+        amount,
+      });
 
   if (!topup) {
     const errorContainer = createErrorContainer(botVi.topupFailed, botVi.topupFailedHint);

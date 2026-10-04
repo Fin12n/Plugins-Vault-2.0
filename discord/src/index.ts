@@ -13,7 +13,6 @@ import { createChallengeResumeHandler } from './services/upstream/challenge-resu
 import { SpigotChallengeSessionManager } from './services/upstream/spigot-challenge-session.js';
 import { autoMigrateJsonAccountsToDb } from './repositories/spigot-accounts.js';
 import { initNeonDb, type Database } from './db/neon.js';
-import { autoSyncSqliteToNeonIfEmpty } from './services/neon-sync.js';
 import { autoSeedDefaultChannels } from './services/channel-manager.js';
 import { ensureOwnerStaffExists } from './repositories/neon-staffs.js';
 
@@ -53,7 +52,6 @@ async function main(): Promise<void> {
     try {
       neonDb = initNeonDb(env.DATABASE_URL);
       console.log('Neon PostgreSQL: Đã khởi tạo kết nối cơ sở dữ liệu');
-      await autoSyncSqliteToNeonIfEmpty(database, neonDb);
       await autoSeedDefaultChannels(env);
       await ensureOwnerStaffExists(neonDb, env.DISCORD_OWNER_ID);
     } catch (neonErr) {

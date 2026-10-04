@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { createCipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, randomBytes, randomUUID } from 'node:crypto';
 import { eq, and, sql, spigotAccounts, resourceOwnership, plugins } from '@vault/db';
 
 import { db } from '../db/neon.js';
@@ -35,28 +35,31 @@ export function registerSpigotRoutes(app: FastifyInstance) {
       ownedMap.set(o.accountLabel, arr);
     }
 
-    const accounts = rows.map((a: typeof spigotAccounts.$inferSelect) => ({
-      label: a.label,
-      username: a.username,
-      enabled: a.isEnabled,
-      purchasedResources: ownedMap.get(a.label) ?? [],
-      importedStatus: a.status,
-      exclusionReason: a.isEnabled ? '' : 'Đã tắt bởi quản trị viên',
+    const accounts = rows.map((a: typeof spigotAccounts.$inferSelect) => {
+      const isEnabled = a.status === 'active';
+      return {
+        label: a.label,
+        username: a.label,
+        enabled: isEnabled,
+        purchasedResources: ownedMap.get(a.label) ?? [],
+        importedStatus: a.status,
+        exclusionReason: isEnabled ? '' : 'Đã tắt bởi quản trị viên',
 
-      liveScan: a.lastVerifiedAt
-        ? {
-            status: 'ok' as const,
-            lastScanAt: a.lastVerifiedAt.getTime(),
-            resourceCount: (ownedMap.get(a.label) ?? []).length,
-            error: null,
-          }
-        : {
-            status: 'never' as const,
-            lastScanAt: null,
-            resourceCount: null,
-            error: null,
-          },
-    }));
+        liveScan: a.lastVerifiedAt
+          ? {
+              status: 'ok' as const,
+              lastScanAt: a.lastVerifiedAt.getTime(),
+              resourceCount: (ownedMap.get(a.label) ?? []).length,
+              error: null,
+            }
+          : {
+              status: 'never' as const,
+              lastScanAt: null,
+              resourceCount: null,
+              error: null,
+            },
+      };
+    });
 
     return {
       configured: accounts.length > 0,
@@ -64,7 +67,7 @@ export function registerSpigotRoutes(app: FastifyInstance) {
     };
   });
 
-  // Thêm hoặc cập nhật tài khoản Spigot
+  // Thêm hoặc cập nhật tài khoản Spigot (Metadata trong Neon; credentials nằm tại SQLite vault)
   app.post('/api/spigot-accounts', async (request, reply) => {
     const schema = z.object({
       label: z.string().min(1),
@@ -76,30 +79,22 @@ export function registerSpigotRoutes(app: FastifyInstance) {
     });
 
     const data = schema.parse(request.body);
-
-    const passwordEncrypted = data.password ? encryptText(data.password) : '';
-    const xfUserEncrypted = data.xfUser ? encryptText(data.xfUser) : '';
-    const xfSessionEncrypted = data.xfSession ? encryptText(data.xfSession) : '';
+    const accountId = randomUUID();
+    const status = data.isEnabled ? 'active' : 'inactive';
 
     const [account] = await db
       .insert(spigotAccounts)
       .values({
+        accountId,
         label: data.label,
-        username: data.username,
-        passwordEncrypted,
-        xfUserEncrypted,
-        xfSessionEncrypted,
-        isEnabled: data.isEnabled,
+        status,
+        health: 'healthy',
         updatedAt: new Date(),
       })
       .onConflictDoUpdate({
         target: spigotAccounts.label,
         set: {
-          username: data.username,
-          ...(passwordEncrypted ? { passwordEncrypted } : {}),
-          ...(xfUserEncrypted ? { xfUserEncrypted } : {}),
-          ...(xfSessionEncrypted ? { xfSessionEncrypted } : {}),
-          isEnabled: data.isEnabled,
+          status,
           updatedAt: new Date(),
         },
       })
@@ -120,14 +115,17 @@ export function registerSpigotRoutes(app: FastifyInstance) {
 
     if (!current) return reply.code(404).send({ error: 'Tài khoản không tồn tại' });
 
+    const isCurrentlyActive = current.status === 'active';
+    const nextStatus = isCurrentlyActive ? 'inactive' : 'active';
+
     const [updated] = await db
       .update(spigotAccounts)
-      .set({ isEnabled: !current.isEnabled, updatedAt: new Date() })
+      .set({ status: nextStatus, updatedAt: new Date() })
       .where(eq(spigotAccounts.label, label))
       .returning();
 
     if (!updated) return reply.code(500).send({ error: 'Không thể đổi trạng thái tài khoản' });
-    return { ok: true, enabled: updated.isEnabled };
+    return { ok: true, enabled: updated.status === 'active' };
   });
 
   // Xoá tài khoản Spigot
@@ -169,10 +167,11 @@ export function registerSpigotRoutes(app: FastifyInstance) {
       const ownedResSet = new Set(ownedResources.map((o: typeof resourceOwnership.$inferSelect) => o.resourceId));
       const matchedPlugins = allPlugins.filter((p: PluginSummary) => p.resourceId && ownedResSet.has(p.resourceId));
 
+      const isEnabled = a.status === 'active';
       return {
         label: a.label,
-        username: a.username,
-        enabled: a.isEnabled,
+        username: a.label,
+        enabled: isEnabled,
         purchasedCount: ownedResources.length,
         ownedPlugins: matchedPlugins.map((mp: PluginSummary) => ({
           id: mp.id,

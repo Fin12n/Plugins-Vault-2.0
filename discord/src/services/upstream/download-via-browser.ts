@@ -290,7 +290,6 @@ async function waitForRealPage(
         await delay(waitMs);
         await tryClickTurnstile(page, { skipWait: true });
         await delay(process.env.VITEST ? 50 : 3_000);
-        continue;
       }
     }
 
