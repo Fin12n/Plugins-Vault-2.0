@@ -6,6 +6,9 @@ import { getSettings, setSetting } from '../../db/settings-store.js';
 import type { Env } from '../../config/env.js';
 import { expireStaleOrders } from '../../repositories/orders.js';
 import { expireStaleTopups } from '../../repositories/wallet-topups.js';
+import { expireStaleOrders as expireStaleOrdersNeon } from '../../repositories/neon-orders.js';
+import { expireStaleTopups as expireStaleTopupsNeon } from '../../repositories/neon-wallet-topups.js';
+import type { Database } from '../../db/neon.js';
 import { isCard2kConfigured, type Card2kConfig } from '../card/card2k-client.js';
 import { pollPendingCards } from '../card/submit-card-topup.js';
 import { sweepExpiredTokens } from '../delivery/mint-download-token.js';
@@ -146,6 +149,7 @@ const COOKIE_REFRESH_DAYS = 20;
 
 export type MaintenanceDeps = {
   db: Db;
+  neonDb?: Database;
   env: Env;
   vaultDir: string;
   client?: Client;
@@ -523,18 +527,30 @@ export function startMaintenance(input: MaintenanceDeps): MaintenanceHandle {
 
   const orders = setInterval(() => {
     try {
-      const { expired, refunded } = expireStaleOrders(deps.db);
-      if (expired > 0) {
-        // Refund count is logged separately: coins returning to wallets is money
-        // moving, and it should be visible without reading the ledger.
-        const suffix = refunded > 0 ? `, hoàn coin cho ${refunded} đơn` : '';
-        console.log(`Đã hết hạn ${expired} đơn chưa thanh toán${suffix}`);
-      }
+      if (deps.neonDb) {
+        void expireStaleOrdersNeon(deps.neonDb).then(({ expired, refunded }) => {
+          if (expired > 0) {
+            const suffix = refunded > 0 ? `, hoàn coin cho ${refunded} đơn` : '';
+            console.log(`Đã hết hạn ${expired} đơn chưa thanh toán (Neon)${suffix}`);
+          }
+        }).catch((err) => {
+          console.error('Lỗi khi hết hạn đơn Neon:', err);
+        });
 
-      // Top-ups hold no coins, so expiring one undoes nothing — it only stops a
-      // stale payment code from matching a later transfer.
-      const staleTopups = expireStaleTopups(deps.db);
-      if (staleTopups > 0) console.log(`Đã hết hạn ${staleTopups} phiếu nạp ví`);
+        void expireStaleTopupsNeon(deps.neonDb).then((staleTopups) => {
+          if (staleTopups > 0) console.log(`Đã hết hạn ${staleTopups} phiếu nạp ví (Neon)`);
+        }).catch((err) => {
+          console.error('Lỗi khi hết hạn topup Neon:', err);
+        });
+      } else {
+        const { expired, refunded } = expireStaleOrders(deps.db);
+        if (expired > 0) {
+          const suffix = refunded > 0 ? `, hoàn coin cho ${refunded} đơn` : '';
+          console.log(`Đã hết hạn ${expired} đơn chưa thanh toán${suffix}`);
+        }
+        const staleTopups = expireStaleTopups(deps.db);
+        if (staleTopups > 0) console.log(`Đã hết hạn ${staleTopups} phiếu nạp ví`);
+      }
     } catch (err) {
       console.error('Lỗi khi hết hạn đơn:', err);
     }

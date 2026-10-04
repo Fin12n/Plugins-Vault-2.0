@@ -42,6 +42,7 @@ function makeEnv(root: string): Env {
     SEPAY_ACCOUNT_NUMBER: '0010000000355',
     SEPAY_BANK_CODE: 'Vietcombank',
     SEPAY_CODE_PREFIX: 'vn',
+    DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/mockdb',
     VAULT_DIR: join(root, 'vault'),
     TMP_DIR: join(root, 'tmp'),
     DB_PATH: join(root, 'db.sqlite'),
@@ -462,6 +463,7 @@ describe('sepay webhook route', () => {
   let app: FastifyInstance;
   let db: Database.Database;
   let root: string;
+  let mockNeonDb: any;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'sepay-http-'));
@@ -470,9 +472,59 @@ describe('sepay webhook route', () => {
     db.pragma('foreign_keys = ON');
     migrate(db);
     seedSettings(db, env);
+
+    const sepayTxMap = new Map<number, any>();
+    mockNeonDb = {
+      select: () => ({
+        from: () => ({
+          where: (cond: any) => ({
+            limit: () => {
+              let sepayId: number | undefined;
+              if (cond?.queryChunks) {
+                for (const chunk of cond.queryChunks) {
+                  if (chunk && typeof chunk.value === 'number') {
+                    sepayId = chunk.value;
+                    break;
+                  }
+                  if (chunk && chunk.value && typeof chunk.value === 'object' && 'value' in chunk.value) {
+                    sepayId = chunk.value.value;
+                    break;
+                  }
+                }
+              }
+              if (!sepayId && cond?.right?.value !== undefined) {
+                sepayId = cond.right.value;
+              }
+              if (sepayId && sepayTxMap.has(sepayId)) {
+                return [sepayTxMap.get(sepayId)];
+              }
+              return [];
+            },
+          }),
+        }),
+      }),
+      insert: () => ({
+        values: (val: any) => {
+          sepayTxMap.set(val.sepayId, val);
+          try {
+            db.prepare(
+              'INSERT OR IGNORE INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, raw_payload, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            ).run(val.sepayId, val.amount, val.transferType, val.code ?? '', val.content ?? '', val.description ?? '', JSON.stringify(val.rawPayload ?? {}), 1000);
+          } catch {}
+          return { returning: () => [{ id: val.sepayId, ...val }] };
+        },
+      }),
+      update: () => ({
+        set: () => ({
+          where: () => Promise.resolve(),
+        }),
+      }),
+      transaction: async (cb: any) => cb(mockNeonDb),
+    };
+
     // No delivery deps: this exercises the acknowledgement contract and signature
     // handling, which are independent of Discord.
-    app = await buildServer({ db, env });
+    app = await buildServer({ db, neonDb: mockNeonDb, env });
   });
 
   afterEach(async () => {

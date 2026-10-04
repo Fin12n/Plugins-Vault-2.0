@@ -10,6 +10,7 @@ import {
   createSessionCookie,
   makeLoginRateLimiter,
   passwordMatches,
+  type SessionRole,
 } from '../auth/session.js';
 
 const SESSION_TTL_SECONDS = 12 * 60 * 60; // 12 hours
@@ -177,7 +178,12 @@ export function registerAuthRoutes(app: FastifyInstance) {
         return reply.redirect('/?error=unauthorized');
       }
 
-      const role: 'owner' | 'staff' = isOwner || staffMember?.role === 'owner' ? 'owner' : 'staff';
+      const role: SessionRole =
+        isOwner || staffMember?.role === 'owner'
+          ? 'owner'
+          : (['admin', 'moderator', 'support', 'staff'].includes(staffMember?.role as string)
+              ? (staffMember?.role as SessionRole)
+              : 'staff');
       const displayName = discordUser.global_name || discordUser.username;
       const avatarUrl = discordUser.avatar
         ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`

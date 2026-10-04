@@ -19,8 +19,8 @@ RUN pnpm install --frozen-lockfile
 COPY packages/db ./packages/db
 COPY dashboard ./dashboard
 
-# Build Frontend Vite
-RUN pnpm --filter plugin-vault-dashboard run build:client
+# Build Frontend Vite & Backend Server
+RUN pnpm --filter plugin-vault-dashboard run build
 
 # ------------------------------------------------------------------------------
 # Production Runner (Tối ưu kích thước, siêu nhẹ, không cần Chrome)
@@ -38,7 +38,7 @@ COPY --from=builder /app/package.json /app/pnpm-workspace.yaml /app/pnpm-lock.ya
 COPY --from=builder /app/packages/db ./packages/db
 COPY --from=builder /app/dashboard/package.json ./dashboard/
 COPY --from=builder /app/dashboard/dist ./dashboard/dist
-COPY --from=builder /app/dashboard/server ./dashboard/server
+COPY --from=builder /app/dashboard/dist-server ./dashboard/dist-server
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dashboard/node_modules ./dashboard/node_modules
 

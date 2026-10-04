@@ -1,4 +1,4 @@
-import { createDatabaseConnection, type Database } from "@vault/db";
+import { createDatabaseConnection, type Database, sql } from "@vault/db";
 
 let drizzleInstance: Database | undefined;
 let currentUrl: string | undefined;
@@ -32,6 +32,14 @@ export function getNeonDb(): Database {
     );
   }
   return drizzleInstance;
+}
+
+/**
+ * Ping kiểm tra kết nối Neon PostgreSQL (fail-closed check).
+ */
+export async function pingNeon(dbInstance?: Database): Promise<void> {
+  const targetDb = dbInstance ?? getNeonDb();
+  await targetDb.execute(sql`SELECT 1`);
 }
 
 export type { Database };

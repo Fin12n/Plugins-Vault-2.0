@@ -11,10 +11,11 @@ import { isCard2kConfigured } from './services/card/card2k-client.js';
 import { isBenignBrowserCleanupError } from './services/upstream/browser-cleanup-error.js';
 import { createChallengeResumeHandler } from './services/upstream/challenge-resume.js';
 import { SpigotChallengeSessionManager } from './services/upstream/spigot-challenge-session.js';
-import { autoMigrateJsonAccountsToDb } from './repositories/spigot-accounts.js';
-import { initNeonDb, type Database } from './db/neon.js';
+import { initNeonDb, pingNeon, type Database } from './db/neon.js';
 import { autoSeedDefaultChannels } from './services/channel-manager.js';
 import { ensureOwnerStaffExists } from './repositories/neon-staffs.js';
+import { autoMigrateJsonAccountsToDb } from './repositories/spigot-accounts.js';
+import { startDeliveryScheduler } from './services/delivery/neon-delivery-scheduler.js';
 
 /** Teardown callbacks registered by the HTTP server and Discord client. */
 const shutdownHooks: (() => Promise<void> | void)[] = [];
@@ -47,16 +48,15 @@ async function main(): Promise<void> {
       : `Schema đã ở phiên bản mới nhất (v${result.to})`,
   );
 
-  let neonDb: Database | undefined;
-  if (env.DATABASE_URL) {
-    try {
-      neonDb = initNeonDb(env.DATABASE_URL);
-      console.log('Neon PostgreSQL: Đã khởi tạo kết nối cơ sở dữ liệu');
-      await autoSeedDefaultChannels(env);
-      await ensureOwnerStaffExists(neonDb, env.DISCORD_OWNER_ID);
-    } catch (neonErr) {
-      console.warn('Neon PostgreSQL: Chưa thể kết nối:', neonErr instanceof Error ? neonErr.message : neonErr);
-    }
+  const neonDb: Database = initNeonDb(env.DATABASE_URL);
+  try {
+    await pingNeon(neonDb);
+    console.log('Neon PostgreSQL: Đã kết nối và xác thực cơ sở dữ liệu thành công');
+    await autoSeedDefaultChannels(env);
+    await ensureOwnerStaffExists(neonDb, env.DISCORD_OWNER_ID);
+  } catch (neonErr) {
+    console.error('❌ Neon PostgreSQL: Kết nối thất bại, ứng dụng dừng khẩn cấp (Fail-Closed):', neonErr instanceof Error ? neonErr.message : neonErr);
+    process.exit(1);
   }
 
   seedSettings(database, env);
@@ -138,6 +138,7 @@ async function main(): Promise<void> {
   // when the token is wrong.
   const { client, login } = createBotClient({
     db: database,
+    neonDb,
     env,
     delivery: deliveryConfig,
     orders: orderConfig,
@@ -145,6 +146,16 @@ async function main(): Promise<void> {
     maintenance: maintenanceControl,
   });
   onShutdown(() => client.destroy());
+
+  const deliveryScheduler = startDeliveryScheduler({
+    neonDb,
+    client,
+    vaultDir: env.VAULT_DIR,
+    publicBaseUrl: env.PUBLIC_BASE_URL,
+    attachMaxBytes: settings.attachMaxBytes,
+    tokenTtlMinutes: settings.downloadTokenTtlMinutes,
+  });
+  onShutdown(() => deliveryScheduler.stop());
 
   const app = await buildServer({
     db: database,
@@ -167,6 +178,7 @@ async function main(): Promise<void> {
 
   maintenance = startMaintenance({
     db: database,
+    neonDb,
     env,
     vaultDir: env.VAULT_DIR,
     client,
@@ -185,6 +197,13 @@ async function shutdown(signal: string, code = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\nNhận ${signal}, đang dừng...`);
+
+  // Hard timeout: Buộc dừng tiến trình nếu graceful shutdown vượt quá 30 giây
+  const forceExitTimer = setTimeout(() => {
+    console.error('⚠️ Quá thời gian chờ shutdown (30s) — Buộc thoát khẩn cấp');
+    process.exit(1);
+  }, 30_000);
+  forceExitTimer.unref();
 
   // Stop accepting work before closing the database, or an in-flight request
   // hits a closed handle.

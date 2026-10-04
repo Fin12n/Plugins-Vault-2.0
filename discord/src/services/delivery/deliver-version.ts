@@ -1,6 +1,6 @@
 import { AttachmentBuilder, DiscordAPIError, RESTJSONErrorCodes, type Client } from 'discord.js';
-import { join } from 'node:path';
-import { stat } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
 import type { Db } from '../../db/connection.js';
 import { now } from '../../db/connection.js';
 import type { DeliveryMethod, DeliveryOutcome } from '../../domain/audit.js';
@@ -39,6 +39,8 @@ export type DeliveryRequest = {
  * raise it. Attachment is a convenience for small files only.
  */
 export async function resolveBlobPath(vaultDir: string, relPath: string): Promise<string | null> {
+  const canonicalVault = await realpath(vaultDir).catch(() => resolve(vaultDir));
+
   const candidates = [
     join(vaultDir, relPath),
     join(process.cwd(), vaultDir, relPath),
@@ -46,13 +48,24 @@ export async function resolveBlobPath(vaultDir: string, relPath: string): Promis
     join(process.cwd(), 'discord', vaultDir, relPath),
     join(process.cwd(), 'discord/vault', relPath),
   ];
+
   for (const candidate of candidates) {
-    const present = await stat(candidate).then(
-      () => true,
-      () => false,
-    );
-    if (present) return candidate;
+    try {
+      const realCandidate = await realpath(candidate);
+      // Kiểm tra jail: File thực tế phải nằm trong canonicalVault
+      if (realCandidate.startsWith(canonicalVault + sep) || realCandidate === canonicalVault) {
+        return realCandidate;
+      }
+      console.warn(
+        `[resolveBlobPath] Cảnh báo an ninh: Phát hiện đường dẫn/symlink thoát khỏi vault: candidate=${candidate}, real=${realCandidate}`
+      );
+      return null;
+    } catch {
+      // Candidate không tồn tại hoặc không thể resolve
+      continue;
+    }
   }
+
   return null;
 }
 

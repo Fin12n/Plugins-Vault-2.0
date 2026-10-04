@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, desc, count, sql, wallets, walletLedger, cardTopups } from '@vault/db';
 import { db } from '../db/neon.js';
+import { requireRole } from '../auth/rbac.js';
 
 const pageQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -72,61 +73,79 @@ export function registerWalletsRoutes(app: FastifyInstance) {
     }));
   });
 
-  // Cộng / trừ tiền thủ công (Điều chỉnh số dư)
-  app.post('/api/wallets/:discordUserId/adjust', async (request, reply) => {
-    const { discordUserId } = z
-      .object({ discordUserId: z.string() })
-      .parse(request.params);
-    const { delta, note } = z
-      .object({
-        delta: z.number().int(),
-        note: z.string().min(1),
-      })
-      .parse(request.body);
+  // Cộng / trừ tiền thủ công (Điều chỉnh số dư - Chỉ dành cho OWNER)
+  app.post(
+    '/api/wallets/:discordUserId/adjust',
+    { preHandler: requireRole(['owner']) },
+    async (request, reply) => {
+      const { discordUserId } = z
+        .object({ discordUserId: z.string() })
+        .parse(request.params);
+      const { delta, note } = z
+        .object({
+          delta: z.number().int(),
+          note: z.string().min(1),
+        })
+        .parse(request.body);
 
-    if (delta === 0) {
-      return reply.code(400).send({ error: 'Số tiền thay đổi không được bằng 0' });
-    }
-
-    const updated = await db.transaction(async (tx) => {
-      const [w] = await tx
-        .select()
-        .from(wallets)
-        .where(eq(wallets.discordUserId, discordUserId))
-        .limit(1);
-
-      const currentBalance = w?.balance ?? 0;
-      const newBalance = currentBalance + delta;
-      if (newBalance < 0) {
-        throw new Error('Số dư ví không được âm sau khi điều chỉnh');
+      if (delta === 0) {
+        return reply.code(400).send({ error: 'Số tiền thay đổi không được bằng 0' });
       }
 
-      await tx
-        .insert(wallets)
-        .values({
-          discordUserId,
-          balance: newBalance,
-          updatedAt: new Date(),
-        })
-        .onConflictDoUpdate({
-          target: wallets.discordUserId,
-          set: { balance: newBalance, updatedAt: new Date() },
+      try {
+        const updated = await db.transaction(async (tx) => {
+          // Đảm bảo hàng ví tồn tại trước khi khóa
+          await tx
+            .insert(wallets)
+            .values({
+              discordUserId,
+              balance: 0,
+              updatedAt: new Date(),
+            })
+            .onConflictDoNothing({ target: wallets.discordUserId });
+
+          // Khóa dòng ví FOR UPDATE chống race condition / lost update
+          const [w] = await tx
+            .select()
+            .from(wallets)
+            .where(eq(wallets.discordUserId, discordUserId))
+            .for('update');
+
+          const currentBalance = w?.balance ?? 0;
+          const newBalance = currentBalance + delta;
+          if (newBalance < 0) {
+            throw new Error('Số dư ví không được âm sau khi điều chỉnh');
+          }
+
+          await tx
+            .update(wallets)
+            .set({
+              balance: newBalance,
+              updatedAt: new Date(),
+            })
+            .where(eq(wallets.discordUserId, discordUserId));
+
+          const actor =
+            request.sessionUser?.displayName || request.sessionUser?.username || 'Owner';
+          await tx.insert(walletLedger).values({
+            discordUserId,
+            delta,
+            balanceAfter: newBalance,
+            kind: 'manual_adjust',
+            refType: 'admin',
+            note: `[${actor}] ${note}`,
+          });
+
+          return { discordUserId, balance: newBalance };
         });
 
-      await tx.insert(walletLedger).values({
-        discordUserId,
-        delta,
-        balanceAfter: newBalance,
-        kind: 'manual_adjust',
-        refType: 'admin',
-        note: `[Admin] ${note}`,
-      });
-
-      return { discordUserId, balance: newBalance };
-    });
-
-    return { ok: true, wallet: updated };
-  });
+        return { ok: true, wallet: updated };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return reply.code(400).send({ error: msg });
+      }
+    }
+  );
 
   // Kiểm tra đối soát lệch số dư (Reconcile Drift)
   app.get('/api/wallets/reconcile', async () => {

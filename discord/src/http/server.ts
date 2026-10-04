@@ -43,7 +43,7 @@ export type MaintenanceControl = {
   rotateProxy?: () => Promise<{ ok: boolean; currentProxyIp: string | null; error?: string }>;
 };
 
-import type { Database } from '../db/neon.js';
+import { pingNeon, type Database } from '../db/neon.js';
 
 export type ServerDeps = {
   db: Db;
@@ -90,6 +90,33 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       return reply.code(status).send({ error: 'Máy chủ gặp lỗi khi xử lý yêu cầu' });
     }
     return reply.code(status).send({ error: error instanceof Error ? error.message : 'Yêu cầu không hợp lệ' });
+  });
+
+  // Health check có kiểm tra kết nối Neon
+  app.get('/api/health', async (_request, reply) => {
+    try {
+      if (deps.neonDb) {
+        await pingNeon(deps.neonDb);
+      }
+      return reply.code(200).send({
+        status: 'ok',
+        service: 'vault-discord-bot',
+        database: deps.neonDb ? 'connected' : 'local_only',
+        discordReady: deps.delivery?.client?.isReady() ?? false,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      return reply.code(503).send({
+        status: 'unhealthy',
+        service: 'vault-discord-bot',
+        error: err instanceof Error ? err.message : String(err),
+        timestamp: Date.now(),
+      });
+    }
+  });
+
+  app.get('/health', async (_request, reply) => {
+    return reply.redirect('/api/health');
   });
 
   // routeSpecific keeps the raw-body capture on the webhook route only, so normal

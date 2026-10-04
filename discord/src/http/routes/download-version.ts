@@ -10,7 +10,7 @@ import type { Database } from '../../db/neon.js';
 import { findVersionWithPlugin } from '../../repositories/versions.js';
 import { findVersionById } from '../../repositories/neon-versions.js';
 import { findPluginById } from '../../repositories/neon-plugins.js';
-import { suggestFilename } from '../../services/delivery/deliver-version.js';
+import { resolveBlobPath, suggestFilename } from '../../services/delivery/deliver-version.js';
 import { redeemDownloadToken } from '../../services/delivery/mint-download-token.js';
 import {
   claimDownloadToken,
@@ -57,23 +57,24 @@ export function registerDownloadRoute(
       const pluginSlug = plugin?.slug ?? String(version.pluginId);
       filename = suggestFilename(pluginSlug, version.version, version.originalName);
 
-      const path = join(deps.env.VAULT_DIR, relPath);
-      const stats = await stat(path).catch(() => null);
+      const blobPath = await resolveBlobPath(deps.env.VAULT_DIR, relPath);
 
-      if (!stats) {
-        // Compensation Unclaim: Tệp không có trong kho local -> giải phóng token
+      if (!blobPath) {
+        // Compensation Unclaim: Tệp không có trong kho local hoặc không an toàn -> giải phóng token
         await unclaimDownloadToken(deps.neonDb, tokenHashHex, 'file_missing_in_vault');
         return reply.code(410).send({ error: 'Tệp không còn trong kho' });
       }
+
+      const stats = await stat(blobPath);
 
       reply.header('content-type', 'application/java-archive');
       reply.header('content-disposition', contentDisposition(filename));
       reply.header('content-length', String(stats.size));
       reply.header('cache-control', 'no-store');
 
-      const stream = createReadStream(path);
+      const stream = createReadStream(blobPath);
       stream.on('error', () => {
-        request.log.error({ path }, 'lỗi khi đọc tệp trong kho');
+        request.log.error({ path: blobPath }, 'lỗi khi đọc tệp trong kho');
         reply.raw.destroy();
       });
 
@@ -93,9 +94,9 @@ export function registerDownloadRoute(
       const version = findVersionWithPlugin(deps.db, redeemed.versionId);
       if (!version) return reply.code(410).send({ error: 'Phiên bản không còn tồn tại' });
 
-      const path = join(deps.env.VAULT_DIR, version.relPath);
-      const stats = await stat(path).catch(() => null);
-      if (!stats) return reply.code(410).send({ error: 'Tệp không còn trong kho' });
+      const blobPath = await resolveBlobPath(deps.env.VAULT_DIR, version.relPath);
+      if (!blobPath) return reply.code(410).send({ error: 'Tệp không còn trong kho' });
+      const stats = await stat(blobPath);
 
       filename = suggestFilename(version.pluginSlug, version.version, version.originalName);
 
@@ -104,9 +105,9 @@ export function registerDownloadRoute(
       reply.header('content-length', String(stats.size));
       reply.header('cache-control', 'no-store');
 
-      const stream = createReadStream(path);
+      const stream = createReadStream(blobPath);
       stream.on('error', () => {
-        request.log.error({ path }, 'lỗi khi đọc tệp trong kho');
+        request.log.error({ path: blobPath }, 'lỗi khi đọc tệp trong kho');
         reply.raw.destroy();
       });
 

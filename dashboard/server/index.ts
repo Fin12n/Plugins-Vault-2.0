@@ -18,6 +18,9 @@ import { registerSpigotRoutes } from './routes/spigot-routes.js';
 import { registerStatsRoutes } from './routes/stats-routes.js';
 import { registerSettingsRoutes } from './routes/settings-routes.js';
 import { registerUploadRoutes } from './routes/upload-routes.js';
+import { registerLogRoutes } from './routes/log-routes.js';
+import { registerLeaderboardRoutes } from './routes/leaderboard-routes.js';
+import { db, pingNeon } from './db/neon.js';
 
 export async function buildDashboardServer() {
   const app = Fastify({
@@ -73,12 +76,26 @@ export async function buildDashboardServer() {
     return reply.code(status).send({ error: error instanceof Error ? error.message : 'Yêu cầu không hợp lệ' });
   });
 
-  // Health check
-  app.get('/api/health', async () => ({
-    status: 'ok',
-    service: 'plugin-vault-dashboard',
-    timestamp: Date.now(),
-  }));
+  // Health check có ping thực tế cơ sở dữ liệu Neon
+  app.get('/api/health', async (_request, reply) => {
+    try {
+      await pingNeon(db);
+      return reply.code(200).send({
+        status: 'ok',
+        service: 'plugin-vault-dashboard',
+        database: 'connected',
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      return reply.code(503).send({
+        status: 'unhealthy',
+        service: 'plugin-vault-dashboard',
+        database: 'disconnected',
+        error: err instanceof Error ? err.message : String(err),
+        timestamp: Date.now(),
+      });
+    }
+  });
 
   // Public Auth Routes (Login, Logout, Discord OAuth)
   registerAuthRoutes(app);
@@ -98,6 +115,8 @@ export async function buildDashboardServer() {
     registerStatsRoutes(scope);
     registerSettingsRoutes(scope);
     registerUploadRoutes(scope);
+    registerLogRoutes(scope);
+    registerLeaderboardRoutes(scope);
   });
 
   // Phục vụ Static Files SPA Dashboard nếu có dist/
@@ -160,6 +179,31 @@ if (isMain) {
     console.log(`✨ VAULT ADMIN DASHBOARD ĐANG CHẠY TẠI:`);
     console.log(`👉 http://${env.HOST === '0.0.0.0' ? 'localhost' : env.HOST}:${env.PORT}`);
     console.log(`=================================================\n`);
+
+    let shuttingDown = false;
+    const handleShutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\nNhận tín hiệu ${signal}, đang dừng Dashboard Server...`);
+
+      const forceExitTimer = setTimeout(() => {
+        console.error('⚠️ Quá thời gian chờ shutdown (30s) — Buộc thoát khẩn cấp');
+        process.exit(1);
+      }, 30_000);
+      forceExitTimer.unref();
+
+      try {
+        await server.close();
+        console.log('✅ Dashboard Server đã dừng an toàn');
+        process.exit(0);
+      } catch (err) {
+        console.error('Lỗi khi dừng server:', err);
+        process.exit(1);
+      }
+    };
+
+    process.on('SIGINT', () => void handleShutdown('SIGINT'));
+    process.on('SIGTERM', () => void handleShutdown('SIGTERM'));
   } catch (err) {
     console.error('❌ Khởi động Dashboard Server thất bại:', err);
     process.exit(1);

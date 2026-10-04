@@ -3,9 +3,11 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 
 export const COOKIE_NAME = 'vault_session';
 
+export type SessionRole = 'owner' | 'admin' | 'moderator' | 'support' | 'staff';
+
 export type SessionPayload = {
   userId?: string;
-  role: 'owner' | 'staff';
+  role: SessionRole;
   username: string;
   displayName: string;
   avatar?: string | null;

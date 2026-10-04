@@ -5,12 +5,10 @@ import type { Db } from '../../db/connection.js';
 import type { SepayWebhookPayload } from '../../domain/order.js';
 import type { DeliveryDeps } from '../../services/delivery/deliver-version.js';
 import type { Database } from '../../db/neon.js';
-import { applySepayTransfer, fulfilOrder } from '../../services/payment/match-and-fulfil-order.js';
 import { applySepayTransferNeon } from '../../services/payment/neon-payment-flow.js';
 import { getWalletBalance } from '../../repositories/neon-wallets.js';
 import { verifySepaySignature } from '../../services/payment/verify-sepay-signature.js';
 import { botVi } from '../../bot/i18n/bot-vi.js';
-import { getBalance } from '../../repositories/wallets.js';
 import { processNextDeliveryJob } from '../../services/delivery/neon-delivery-worker.js';
 
 /**
@@ -97,9 +95,12 @@ export function registerSepayWebhook(
         'webhook SePay nhận được',
       );
 
-      const outcome = deps.neonDb
-        ? await applySepayTransferNeon(deps.neonDb, payload)
-        : applySepayTransfer(deps.db, payload);
+      if (!deps.neonDb) {
+        request.log.error('Neon PostgreSQL không khả dụng cho webhook SePay — Từ chối để SePay retry (Fail-Closed)');
+        return reply.code(503).send({ success: false, message: 'database unavailable' });
+      }
+
+      const outcome = await applySepayTransferNeon(deps.neonDb, payload);
 
       // The literal body matters; Fastify's default empty 200 counts as a failure
       // and would trigger retries.
@@ -117,9 +118,7 @@ export function registerSepayWebhook(
           const client = deps.delivery.client;
           // Balance read after crediting, so the message states where they now
           // stand rather than only what moved.
-          const balance = deps.neonDb
-            ? await getWalletBalance(deps.neonDb, outcome.discordUserId)
-            : getBalance(deps.db, outcome.discordUserId);
+          const balance = await getWalletBalance(deps.neonDb, outcome.discordUserId);
           void client.users
             .fetch(outcome.discordUserId)
             .then((user) => user.send(botVi.topupCredited(outcome.credited, balance)))
@@ -146,35 +145,21 @@ export function registerSepayWebhook(
           return reply;
         }
         const delivery = deps.delivery;
-        if (deps.neonDb) {
-          void processNextDeliveryJob({
-            neonDb: deps.neonDb,
-            client: deps.delivery.client,
-            vaultDir: deps.delivery.vaultDir,
-            publicBaseUrl: deps.delivery.publicBaseUrl,
-            attachMaxBytes: deps.delivery.attachMaxBytes,
-            tokenTtlMinutes: deps.delivery.tokenTtlMinutes,
-          }).then((res) => {
-            if (!res.success && res.processed) {
-              request.log.error(
-                { orderId: outcome.orderId, reason: res.reason },
-                'giao hàng Neon thất bại sau khi thanh toán',
-              );
-            }
-          });
-        } else {
-          // Deliberately not awaited: the acknowledgement has already been sent and
-          // delivery talks to Discord. An unhandledRejection handler in the entry
-          // point keeps a failure here from taking down the process.
-          void fulfilOrder({ db: deps.db, delivery }, outcome.orderId).then((result) => {
-            if (!result.ok) {
-              request.log.error(
-                { orderId: outcome.orderId, reason: result.reason },
-                'giao hàng thất bại sau khi thanh toán',
-              );
-            }
-          });
-        }
+        void processNextDeliveryJob({
+          neonDb: deps.neonDb,
+          client: delivery.client,
+          vaultDir: delivery.vaultDir,
+          publicBaseUrl: delivery.publicBaseUrl,
+          attachMaxBytes: delivery.attachMaxBytes,
+          tokenTtlMinutes: delivery.tokenTtlMinutes,
+        }).then((res) => {
+          if (!res.success && res.processed) {
+            request.log.error(
+              { orderId: outcome.orderId, reason: res.reason },
+              'giao hàng Neon thất bại sau khi thanh toán',
+            );
+          }
+        });
       }
 
       return reply;

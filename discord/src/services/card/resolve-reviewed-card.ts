@@ -9,6 +9,8 @@
 import type { Db } from '../../db/connection.js';
 import { claimCardCredit, findCardTopupById, scrubCardCode } from '../../repositories/card-topups.js';
 import { applyLedgerEntry } from '../../repositories/wallets.js';
+import { getNeonDb } from '../../db/neon.js';
+import { applyLedgerEntry as applyLedgerEntryNeon } from '../../repositories/neon-wallets.js';
 
 /**
  * Credits a reviewed card, at an amount the owner supplies.
@@ -17,9 +19,12 @@ import { applyLedgerEntry } from '../../repositories/wallets.js';
  * never told us its real value. Returns false when the credit was already claimed.
  */
 export function creditReviewedCard(db: Db, id: number, amount: number): boolean {
+  let cardUserId: string | undefined;
+
   const credited = db.transaction((): boolean => {
     const card = findCardTopupById(db, id);
     if (!card) return false;
+    cardUserId = card.discordUserId;
     if (!claimCardCredit(db, id)) return false;
 
     applyLedgerEntry(db, {
@@ -32,12 +37,6 @@ export function creditReviewedCard(db: Db, id: number, amount: number): boolean 
     });
     // Mirrors the automatic path so the dashboard shows a settled state rather
     // than leaving the row looking unresolved forever.
-    //
-    // net_amount defaults to the credited amount when the provider never reported
-    // one. It feeds the monthly fee figure, which sums credited minus received —
-    // leaving it NULL would report this card as 100% fee and overstate the owner's
-    // cost by its whole face value. Equal values claim no fee, which is the honest
-    // answer when the payout is genuinely unknown.
     db.prepare(
       `UPDATE card_topups
           SET status = 'success', actual_value = ?, net_amount = coalesce(net_amount, ?)
@@ -46,7 +45,30 @@ export function creditReviewedCard(db: Db, id: number, amount: number): boolean 
     return true;
   })();
 
-  if (credited) scrubCardCode(db, id);
+  if (credited) {
+    scrubCardCode(db, id);
+
+    if (cardUserId) {
+      try {
+        const neonDb = getNeonDb();
+        if (neonDb) {
+          void applyLedgerEntryNeon(neonDb, {
+            discordUserId: cardUserId,
+            delta: amount,
+            kind: 'card_credit',
+            refType: 'card',
+            refId: id,
+            note: 'chủ kho xử lý tay',
+          }).catch((err) => {
+            console.error('Lỗi khi ghi sổ cái Neon cho thẻ duyệt tay:', err);
+          });
+        }
+      } catch {
+        // Ignored in offline tests
+      }
+    }
+  }
+
   return credited;
 }
 

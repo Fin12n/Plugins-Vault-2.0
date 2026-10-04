@@ -17,6 +17,7 @@ const validEnv = {
   SEPAY_ACCOUNT_NUMBER: '0010000000355',
   SEPAY_BANK_CODE: 'Vietcombank',
   SEPAY_CODE_PREFIX: 'vn',
+  DATABASE_URL: 'postgresql://postgres:postgres@ep-test.ap-southeast-1.aws.neon.tech/neondb?sslmode=require',
 };
 
 describe('envSchema', () => {
@@ -27,6 +28,13 @@ describe('envSchema', () => {
     expect(parsed.TRUST_PROXY).toBe(false);
     expect(parsed.SPIGOT_INTERACTIVE_CHALLENGE).toBe(false);
     expect(parsed.SPIGOT_CHALLENGE_COOLDOWN_MS).toBe(30 * 60_000);
+    expect(parsed.DATABASE_URL).toBe('postgresql://postgres:postgres@ep-test.ap-southeast-1.aws.neon.tech/neondb?sslmode=require');
+  });
+
+  it('rejects missing or invalid DATABASE_URL (fail-closed)', () => {
+    expect(envSchema.safeParse({ ...validEnv, DATABASE_URL: undefined }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validEnv, DATABASE_URL: '' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validEnv, DATABASE_URL: 'not-a-valid-url' }).success).toBe(false);
   });
 
   it('names every missing variable rather than failing on the first', () => {
@@ -36,6 +44,7 @@ describe('envSchema', () => {
     const keys = result.error.issues.map((i) => i.path.join('.'));
     expect(keys).toContain('DISCORD_TOKEN');
     expect(keys).toContain('SEPAY_CODE_PREFIX');
+    expect(keys).toContain('DATABASE_URL');
     expect(keys.length).toBeGreaterThan(10);
   });
 

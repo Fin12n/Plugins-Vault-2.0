@@ -1,8 +1,10 @@
 import { eq, sql } from "drizzle-orm";
 import type { Database } from "../../db/neon.js";
-import type { SepayWebhookPayload } from "../../domain/order.js";
+import type { SepayWebhookPayload, CreatedOrder } from "../../domain/order.js";
 import {
   orders,
+  wallets,
+  walletLedger,
   walletTopups,
   sepayTransactions,
   deliveryJobs,
@@ -15,6 +17,11 @@ import { findOrderByCode } from "../../repositories/neon-orders.js";
 import { findTopupByCode } from "../../repositories/neon-wallet-topups.js";
 import { recordSepayTransaction, hasSepayTransaction } from "../../repositories/neon-sepay.js";
 import { assertNotFrozen } from "../maintenance/write-freeze.js";
+import { generatePaymentCode, buildVietQrUrl } from "./build-vietqr-url.js";
+import { isCodeAvailableNeon } from "./open-wallet-topup.js";
+import { findVersionById } from "../../repositories/neon-versions.js";
+import { findPluginById } from "../../repositories/neon-plugins.js";
+import type { OrderConfig } from "./match-and-fulfil-order.js";
 
 export type WebhookOutcome =
   | { handled: "duplicate" }
@@ -400,4 +407,137 @@ async function handleTopupPaymentNeon(
       credited: receivedAmount,
     };
   });
+}
+
+/**
+ * Mở đơn hàng mới trực tiếp trên Neon PostgreSQL Authority.
+ * Tuân thủ nghiêm ngặt:
+ * 1. Canonical Lock Order: wallets (SELECT FOR UPDATE) -> orders (INSERT) -> delivery_jobs (INSERT nếu bankDue === 0).
+ * 2. Khấu trừ coin trước (order_hold) nếu người dùng có số dư.
+ * 3. Hỗ trợ đơn thanh toán 100% bằng ví (status = 'wallet_paid') hoặc thanh toán kết hợp / chuyển khoản.
+ */
+export async function openOrderNeon(
+  db: Database,
+  config: OrderConfig,
+  input: { discordUserId: string; versionId: number }
+): Promise<CreatedOrder | null> {
+  assertNotFrozen("Mở đơn hàng mới");
+  const version = await findVersionById(db, input.versionId);
+  if (!version) return null;
+  const plugin = await findPluginById(db, version.pluginId);
+  const pluginName = plugin?.displayName ?? String(version.pluginId);
+  const price = plugin?.depositPrice ?? 0;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generatePaymentCode(config.codePrefix, config.codeSuffixLength);
+    if (!(await isCodeAvailableNeon(db, code))) continue;
+
+    try {
+      const opened = await db.transaction(async (tx) => {
+        // Step 2: Lock wallets FIRST với FOR UPDATE
+        await tx
+          .insert(wallets)
+          .values({
+            discordUserId: input.discordUserId,
+            balance: 0,
+            updatedAt: new Date(),
+          })
+          .onConflictDoNothing({ target: wallets.discordUserId });
+
+        const [lockedWallet] = await tx
+          .select()
+          .from(wallets)
+          .where(eq(wallets.discordUserId, input.discordUserId))
+          .for("update");
+
+        const currentBalance = lockedWallet?.balance ?? 0;
+        const walletPaid = Math.min(currentBalance, price);
+        const bankDue = price - walletPaid;
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + config.ttlMinutes * 60_000);
+        const status = bankDue === 0 ? "wallet_paid" : "pending";
+
+        // Step 3: Insert orders
+        const [created] = await tx
+          .insert(orders)
+          .values({
+            code,
+            discordUserId: input.discordUserId,
+            versionId: version.id,
+            pluginName,
+            versionLabel: version.version ?? "",
+            amount: price,
+            walletPaid,
+            bankDue,
+            status,
+            createdAt: now,
+            expiresAt,
+            paidAt: bankDue === 0 ? now : null,
+          })
+          .returning();
+
+        if (!created) {
+          throw new Error("Không thể tạo đơn hàng");
+        }
+
+        // Khấu trừ số dư ví nếu có coin thanh toán
+        if (walletPaid > 0) {
+          const newBalance = currentBalance - walletPaid;
+          await tx
+            .update(wallets)
+            .set({
+              balance: newBalance,
+              updatedAt: now,
+            })
+            .where(eq(wallets.discordUserId, input.discordUserId));
+
+          await tx.insert(walletLedger).values({
+            discordUserId: input.discordUserId,
+            delta: -walletPaid,
+            balanceAfter: newBalance,
+            kind: "order_hold",
+            refType: "order",
+            refId: created.id,
+            note: `Giữ coin cho đơn hàng #${code}`,
+          });
+        }
+
+        // Step 5: Nếu thanh toán đủ bằng ví -> Tạo delivery_job
+        if (bankDue === 0) {
+          await tx.insert(deliveryJobs).values({
+            orderId: created.id,
+            discordUserId: input.discordUserId,
+            versionId: version.id,
+            requestedMethod: "attachment",
+            status: "queued",
+          });
+        }
+
+        return created;
+      });
+
+      return {
+        id: opened.id,
+        code: opened.code,
+        amount: opened.amount,
+        walletPaid: opened.walletPaid,
+        bankDue: opened.bankDue,
+        qrUrl:
+          opened.bankDue > 0
+            ? buildVietQrUrl({
+                accountNumber: config.accountNumber,
+                bankCode: config.bankCode,
+                amount: opened.bankDue,
+                code: opened.code,
+              })
+            : null,
+        expiresAt: Math.floor(opened.expiresAt.getTime() / 1000),
+      };
+    } catch {
+      // Retry nếu có xung đột mã hoặc giao dịch
+      continue;
+    }
+  }
+
+  return null;
 }

@@ -30,6 +30,7 @@ function makeEnv(root: string): Env {
     SEPAY_ACCOUNT_NUMBER: '0010000000355',
     SEPAY_BANK_CODE: 'Vietcombank',
     SEPAY_CODE_PREFIX: 'vn',
+    DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/mockdb',
     VAULT_DIR: join(root, 'vault'),
     TMP_DIR: join(root, 'tmp'),
     DB_PATH: join(root, 'db.sqlite'),

@@ -108,9 +108,8 @@ export async function processNextDeliveryJob(
         (err.code === RESTJSONErrorCodes.CannotSendMessagesToThisUser ||
           err.code === RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds)
       ) {
-        // DM bị khóa
+        // DM bị khóa: Không bao giờ hạ trạng thái đơn hàng đã thanh toán thành 'underpaid'
         await markDeliveryJobFailed(deps.neonDb, job.id, claimToken, "dm_blocked");
-        await updateOrderStatus(deps.neonDb, job.orderId, "underpaid" as any);
         return { processed: true, jobId: job.id, success: false, reason: "dm_blocked" };
       }
 

@@ -104,7 +104,10 @@ export const envSchema = z.object({
     .transform((v) => v === 'true' || v === '1'),
 
   // Storage & Database
-  DATABASE_URL: z.string().optional().default(process.env.DATABASE_URL || ''),
+  DATABASE_URL: z
+    .string()
+    .min(1, 'DATABASE_URL là bắt buộc (kết nối Neon PostgreSQL)')
+    .url('DATABASE_URL phải là URL hợp lệ (kết nối Neon PostgreSQL)'),
   VAULT_DIR: projectPath('./vault'),
   TMP_DIR: projectPath('./tmp'),
   DB_PATH: projectPath('./data/vault.db'),

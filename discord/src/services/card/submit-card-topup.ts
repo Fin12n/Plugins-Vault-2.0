@@ -27,6 +27,8 @@ import {
   settleCardTopup,
 } from '../../repositories/card-topups.js';
 import { applyLedgerEntry } from '../../repositories/wallets.js';
+import { getNeonDb } from '../../db/neon.js';
+import { applyLedgerEntry as applyLedgerEntryNeon } from '../../repositories/neon-wallets.js';
 import {
   Card2kError,
   checkCard,
@@ -246,9 +248,28 @@ export function applyResult(db: Db, id: number, result: CardResult): { settled: 
     return true;
   })();
 
-  // Only after the money is safely credited: the PIN is the person's proof if
-  // anything went wrong, and a used PIN is worthless anyway.
-  if (credited) scrubCardCode(db, id);
+  if (credited) {
+    scrubCardCode(db, id);
+
+    // Đồng bộ số dư sang Neon PostgreSQL Authority
+    try {
+      const neonDb = getNeonDb();
+      if (neonDb) {
+        void applyLedgerEntryNeon(neonDb, {
+          discordUserId: topup.discordUserId,
+          delta: creditable,
+          kind: 'card_credit',
+          refType: 'card',
+          refId: id,
+          note: result.outcome === 'wrong_amount' ? 'nạp thẻ sai mệnh giá' : 'nạp thẻ cào',
+        }).catch((err) => {
+          console.error('Lỗi khi ghi sổ cái Neon cho thẻ cào:', err);
+        });
+      }
+    } catch {
+      // Ignored if Neon is not configured in current unit test
+    }
+  }
 
   return { settled: true, credited };
 }

@@ -445,6 +445,7 @@ describe('maintenance startup behaviour', () => {
       SEPAY_ACCOUNT_NUMBER: '0010000000355',
       SEPAY_BANK_CODE: 'MBBANK',
       SEPAY_CODE_PREFIX: 'VN',
+      DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/mockdb',
       VAULT_DIR: join(dir, 'vault'),
       TMP_DIR: join(dir, 'tmp'),
       DB_PATH: join(dir, 'db.sqlite'),

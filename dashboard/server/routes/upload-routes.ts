@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { unlink } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import StreamZip from 'node-stream-zip';
 import YAML from 'yaml';
@@ -93,7 +93,7 @@ export function registerUploadRoutes(app: FastifyInstance) {
       .from(pendingIngest)
       .orderBy(desc(pendingIngest.createdAt));
 
-    return rows.map((r: typeof pendingIngest.$inferSelect) => ({
+    const items = rows.map((r: typeof pendingIngest.$inferSelect) => ({
       id: r.id,
       uploadedBy: r.uploadedBy,
       originalFilename: r.originalFilename,
@@ -109,6 +109,8 @@ export function registerUploadRoutes(app: FastifyInstance) {
       createdAt: r.createdAt.getTime(),
       resolvedAt: r.resolvedAt ? r.resolvedAt.getTime() : null,
     }));
+
+    return { items };
   });
 
   // Gán pending ingest vào plugin đã có
@@ -218,7 +220,20 @@ export function registerUploadRoutes(app: FastifyInstance) {
 
     for await (const part of parts) {
       const originalName = part.filename;
-      const tmpFilePath = join(tempDir, `${Date.now()}_${originalName}`);
+      const safeFilename = basename(originalName).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const tmpFilePath = join(tempDir, `${Date.now()}_${safeFilename}`);
+      const resolvedTempPath = resolve(tmpFilePath);
+      const resolvedTempDir = resolve(tempDir);
+      if (!resolvedTempPath.startsWith(resolvedTempDir + sep)) {
+        summary.failed++;
+        results.push({
+          status: 'failed',
+          originalName,
+          code: 'INVALID_FILENAME',
+          detail: 'Tên tệp không hợp lệ hoặc chứa ký tự vượt cấp thư mục',
+        });
+        continue;
+      }
 
       try {
         const hashStream = createHash('sha256');

@@ -27,6 +27,7 @@ tmp/
 
 # Build artifacts & Compiler caches
 dist/
+dist-server/
 build/
 .turbo/
 *.tsbuildinfo

@@ -17,7 +17,9 @@ import { findVersionWithPlugin, listVersionsByPlugin } from '../../repositories/
 import type { DeliveryDeps } from '../../services/delivery/deliver-version.js';
 import { deliverVersion } from '../../services/delivery/deliver-version.js';
 import type { OrderConfig } from '../../services/payment/match-and-fulfil-order.js';
-import { fulfilOrder, openOrder } from '../../services/payment/match-and-fulfil-order.js';
+import { openOrderNeon } from '../../services/payment/neon-payment-flow.js';
+import { processNextDeliveryJob } from '../../services/delivery/neon-delivery-worker.js';
+import { getNeonDb, type Database } from '../../db/neon.js';
 import { botVi, shortDate } from '../i18n/bot-vi.js';
 import {
   createBrowseContainer,
@@ -74,6 +76,7 @@ export type MaintenanceControl = {
 
 export type BotDeps = {
   db: Db;
+  neonDb?: Database;
   env: Env;
   delivery: DeliveryDeps;
   orders?: OrderConfig;
@@ -400,7 +403,8 @@ async function handleVersionChosen(
   }
 
   if (version.depositPrice > 0 && deps.orders) {
-    const order = openOrder(deps.db, deps.orders, {
+    const neonDb = deps.neonDb ?? getNeonDb();
+    const order = await openOrderNeon(neonDb, deps.orders, {
       discordUserId: interaction.user.id,
       versionId,
     });
@@ -499,9 +503,17 @@ async function deliverWalletPaidOrder(
     createWalletPaidContainer(version, order),
   );
 
-  const result = await fulfilOrder({ db: deps.db, delivery: deps.delivery }, order.id);
+  const neonDb = deps.neonDb ?? getNeonDb();
+  const deliveryResult = await processNextDeliveryJob({
+    neonDb,
+    client: deps.delivery.client,
+    vaultDir: deps.delivery.vaultDir,
+    publicBaseUrl: deps.delivery.publicBaseUrl,
+    attachMaxBytes: deps.delivery.attachMaxBytes,
+    tokenTtlMinutes: deps.delivery.tokenTtlMinutes,
+  });
 
-  if (result.ok) {
+  if (deliveryResult.success) {
     await interaction.editReply(
       v2Payload(createDeliveredContainer(version), [], { ephemeral: true }),
     );
@@ -511,8 +523,8 @@ async function deliverWalletPaidOrder(
   await interaction.editReply(
     v2Payload(
       createErrorContainer(
-        result.reason === 'dm_blocked' ? botVi.dmBlocked : botVi.walletRefunded,
-        result.reason === 'dm_blocked' ? botVi.dmBlockedHint : botVi.walletRefundedHint,
+        deliveryResult.reason === 'dm_blocked' ? botVi.dmBlocked : botVi.walletRefunded,
+        deliveryResult.reason === 'dm_blocked' ? botVi.dmBlockedHint : botVi.walletRefundedHint,
       ),
       [],
       { ephemeral: true },

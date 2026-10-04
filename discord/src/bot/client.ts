@@ -24,7 +24,7 @@ import { handleShelfCommand, handleShelfButton, handleShelfSelect, SHELF_ID } fr
 import { handlePluginInfoCommand, handlePluginInfoAutocomplete } from './commands/plugin-info-commands.js';
 import { handleSpigotAccountCommand } from './commands/spigot-account-commands.js';
 import { handleSetupCommand } from './commands/setup-commands.js';
-import { getNeonDb } from '../db/neon.js';
+import { getNeonDb, type Database } from '../db/neon.js';
 import { isTelco } from '../services/card/card2k-telcos.js';
 import { handleComponentInteraction, type BotDeps } from './components/handle-component-interaction.js';
 import { createErrorContainer, v2Payload } from './components/build-v2-containers.js';
@@ -64,6 +64,7 @@ export function isIgnorableDiscordError(err: unknown): boolean {
 
 export function createBotClient(deps: {
   db: Db;
+  neonDb?: Database;
   env: Env;
   delivery: DeliveryConfig;
   orders?: BotDeps['orders'];
@@ -76,6 +77,7 @@ export function createBotClient(deps: {
 
   const botDeps: BotDeps = {
     db: deps.db,
+    neonDb: deps.neonDb,
     env: deps.env,
     delivery: { ...deps.delivery, client },
     ...(deps.orders ? { orders: deps.orders } : {}),
