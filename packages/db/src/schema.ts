@@ -309,6 +309,7 @@ export const deliveryJobs = pgTable(
     lockedAt: timestamp("locked_at", { withTimezone: true }),
     retryCount: integer("retry_count").default(0).notNull(),
     lastError: text("last_error"),
+    nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -317,7 +318,11 @@ export const deliveryJobs = pgTable(
       table.orderId,
       table.requestedMethod
     ),
-    index("idx_delivery_jobs_status_locked").on(table.status, table.lockedAt),
+    index("idx_delivery_jobs_status_locked").on(
+      table.status,
+      table.nextRetryAt,
+      table.lockedAt
+    ),
     index("idx_delivery_jobs_created").on(table.createdAt),
   ]
 );

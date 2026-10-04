@@ -162,6 +162,7 @@ async function main(): Promise<void> {
     neonDb,
     env,
     delivery: { ...deliveryConfig, client },
+    deliveryScheduler,
     maintenance: maintenanceControl,
     challengeSessions,
   });

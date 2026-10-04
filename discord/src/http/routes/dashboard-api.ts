@@ -42,6 +42,12 @@ import { assignPendingIngest, discardPendingIngest } from '../../services/ingest
 import { findUsedOrderToken, revokeOrderTokens } from '../../services/delivery/mint-download-token.js';
 import { fulfilOrder } from '../../services/payment/match-and-fulfil-order.js';
 import type { DeliveryDeps } from '../../services/delivery/deliver-version.js';
+import type { Database } from '../../db/neon.js';
+import {
+  requeueDeliveryJob,
+  refundOrderWallet as refundOrderWalletNeon,
+} from '../../repositories/neon-orders.js';
+import type { DeliverySchedulerHandle } from '../../services/delivery/neon-delivery-scheduler.js';
 import { listAuditLog, monthBounds, monthlyFundStats } from '../../services/stats/monthly-fund-stats.js';
 import {
   applyLedgerEntry,
@@ -99,8 +105,10 @@ export function registerDashboardRoutes(
   app: FastifyInstance,
   deps: {
     db: Db;
+    neonDb?: Database;
     env: Env;
     delivery?: DeliveryDeps;
+    deliveryScheduler?: DeliverySchedulerHandle;
     maintenance?: MaintenanceControl;
     challengeSessions?: SpigotChallengeSessionController;
   },
@@ -127,6 +135,17 @@ export function registerDashboardRoutes(
 
   app.post('/api/orders/:id/release', async (request, reply) => {
     const { id } = idParam.parse(request.params);
+
+    if (deps.neonDb) {
+      try {
+        const requeued = await requeueDeliveryJob(deps.neonDb, id);
+        deps.deliveryScheduler?.trigger();
+        return { released: true, message: requeued.message };
+      } catch (err) {
+        return reply.code(409).send({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
     if (!deps.delivery) return reply.code(503).send({ error: 'Bot chưa sẵn sàng' });
 
     const result = await fulfilOrder({ db, delivery: deps.delivery }, id, { manual: true });
@@ -143,6 +162,29 @@ export function registerDashboardRoutes(
    */
   app.post('/api/orders/:id/refund-wallet', async (request, reply) => {
     const { id } = idParam.parse(request.params);
+
+    if (deps.neonDb) {
+      try {
+        const refundResult = await refundOrderWalletNeon(
+          deps.neonDb,
+          id,
+          'Quản trị viên hoàn coin từ Dashboard'
+        );
+        return {
+          refunded: refundResult.refundAmount,
+          newBalance: refundResult.newBalance,
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes('DELIVERY_IN_PROGRESS')) {
+          return reply.code(409).send({
+            error: 'Đơn hàng đang trong tiến trình chuyển phát, không thể hoàn tiền lúc này',
+          });
+        }
+        return reply.code(409).send({ error: errMsg });
+      }
+    }
+
     const order = findOrderById(db, id);
     if (!order) return reply.code(404).send({ error: 'Không tìm thấy đơn' });
     if (order.walletPaid === 0) return reply.code(409).send({ error: 'Đơn này không giữ coin nào' });

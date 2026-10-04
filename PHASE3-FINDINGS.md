@@ -6,10 +6,8 @@ Tài liệu ghi nhận các vấn đề được phát hiện trong quá trình 
 
 ### Finding 1: Delivery Claim vs Admin Refund Concurrency Race
 - **File**: `discord/src/services/delivery/neon-delivery-worker.ts`
-- **Line**: 40-75
-- **Issue**: Tiến trình delivery worker claim `delivery_job` và thực hiện I/O ngoại vi (gửi Discord DM / file) có khả năng diễn ra đồng thời với thao tác admin hoàn tiền đơn hàng (`refundOrderWallet`). Cần một locking/state-machine protocol cấp worker để đảm bảo nếu đơn đã bước vào quá trình bàn giao hoặc đã hoàn tiền thì worker không gửi lặp hoặc sai trạng thái.
-- **Why out of scope**: Thuộc phạm vi của Delivery Worker & Scheduler. Phase 3A cấm tuyệt đối sửa đổi Delivery Worker.
-- **Suggested future phase**: Phase 3B — Delivery Worker Hardening.
+- **Status**: **RESOLVED IN PHASE 3B**
+- **Resolution**: Delivery Processing = Delivery Reservation protocol, conditional atomic claim, rejection with `DELIVERY_IN_PROGRESS`, token revocation, exponential backoff, and heartbeat lease management implemented.
 
 ---
 

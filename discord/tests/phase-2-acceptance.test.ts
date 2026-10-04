@@ -425,7 +425,7 @@ describe('PHASE 2 — COMPREHENSIVE ACCEPTANCE TESTS', () => {
         // Mock query claim job
         transaction: async (cb: any) => cb(mockNeonDb),
         select: () => ({
-          from: () => ({
+          from: (table: any) => ({
             where: () => ({
               limit: () => [
                 {
@@ -438,17 +438,33 @@ describe('PHASE 2 — COMPREHENSIVE ACCEPTANCE TESTS', () => {
                   claimToken: 'token_1',
                 },
               ],
-              for: () => [
-                {
-                  id: 301,
-                  orderId: 501,
-                  discordUserId: 'blocked_user',
-                  versionId: 10,
-                  requestedMethod: 'attachment',
-                  status: 'queued',
-                  claimToken: 'token_1',
-                },
-              ],
+              for: () => {
+                const tableName = table?.[Symbol.for('drizzle:Name')] || table?._?.name || '';
+                if (tableName === 'orders') {
+                  return [
+                    {
+                      id: 501,
+                      status: 'paid',
+                      discordUserId: 'blocked_user',
+                      amount: 50000,
+                      bankDue: 50000,
+                      paidAmount: 50000,
+                      walletPaid: 0,
+                    },
+                  ];
+                }
+                return [
+                  {
+                    id: 301,
+                    orderId: 501,
+                    discordUserId: 'blocked_user',
+                    versionId: 10,
+                    requestedMethod: 'attachment',
+                    status: 'queued',
+                    claimToken: 'token_1',
+                  },
+                ];
+              },
             }),
           }),
         }),
@@ -514,6 +530,7 @@ describe('PHASE 2 — COMPREHENSIVE ACCEPTANCE TESTS', () => {
 
       vi.mock('../src/repositories/neon-download-tokens.js', () => ({
         mintDownloadToken: vi.fn().mockResolvedValue({}),
+        revokeDownloadTokensByOrder: vi.fn().mockResolvedValue(0),
       }));
 
       const res = await processNextDeliveryJob({

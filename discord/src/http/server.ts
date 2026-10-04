@@ -44,12 +44,14 @@ export type MaintenanceControl = {
 };
 
 import { pingNeon, type Database } from '../db/neon.js';
+import type { DeliverySchedulerHandle } from '../services/delivery/neon-delivery-scheduler.js';
 
 export type ServerDeps = {
   db: Db;
   neonDb?: Database;
   env: Env;
   delivery?: DeliveryDeps;
+  deliveryScheduler?: DeliverySchedulerHandle;
   maintenance?: MaintenanceControl;
   challengeSessions?: SpigotChallengeSessionController;
 };

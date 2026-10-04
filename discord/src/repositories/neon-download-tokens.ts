@@ -1,9 +1,10 @@
 import { eq, and, sql, isNull } from "drizzle-orm";
 import type { Database } from "../db/neon.js";
+import type { DbOrTx } from "./neon-wallets.js";
 import { downloadTokens, type DownloadToken, type NewDownloadToken } from "@vault/db";
 
 export async function mintDownloadToken(
-  db: Database,
+  db: DbOrTx,
   input: {
     tokenHash: string;
     versionId: number;
@@ -34,7 +35,7 @@ export async function mintDownloadToken(
 }
 
 export async function findDownloadToken(
-  db: Database,
+  db: DbOrTx,
   tokenHash: string
 ): Promise<DownloadToken | null> {
   const result = await db
@@ -48,7 +49,7 @@ export async function findDownloadToken(
  * Atomic claim: Exactly one concurrent request claims the token.
  */
 export async function claimDownloadToken(
-  db: Database,
+  db: DbOrTx,
   tokenHash: string
 ): Promise<DownloadToken | null> {
   const updated = await db
@@ -70,7 +71,7 @@ export async function claimDownloadToken(
  * Compensation unclaim: Giải phóng token nếu tệp bị thiếu/hỏng trên local storage trước khi stream.
  */
 export async function unclaimDownloadToken(
-  db: Database,
+  db: DbOrTx,
   tokenHash: string,
   failureReason: string
 ): Promise<boolean> {
@@ -84,4 +85,24 @@ export async function unclaimDownloadToken(
     .returning({ tokenHash: downloadTokens.tokenHash });
 
   return updated.length === 1;
+}
+
+/**
+ * Thu hồi tất cả các token tải một lần chưa dùng của một đơn hàng khi đơn bị Hoàn tiền / Hủy
+ */
+export async function revokeDownloadTokensByOrder(
+  db: DbOrTx,
+  orderId: number
+): Promise<number> {
+  const deleted = await db
+    .delete(downloadTokens)
+    .where(
+      and(
+        eq(downloadTokens.orderId, orderId),
+        isNull(downloadTokens.usedAt)
+      )
+    )
+    .returning({ tokenHash: downloadTokens.tokenHash });
+
+  return deleted.length;
 }

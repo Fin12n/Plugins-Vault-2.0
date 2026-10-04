@@ -1,11 +1,14 @@
 import { AttachmentBuilder, DiscordAPIError, RESTJSONErrorCodes, type Client } from "discord.js";
 import { createHash, randomBytes } from "node:crypto";
+import { eq } from "drizzle-orm";
 import type { Database } from "../../db/neon.js";
+import { orders, deliveryJobs, type Order } from "@vault/db";
 import {
   claimStaleOrQueuedDeliveryJob,
   markDeliveryJobSuccess,
   markDeliveryJobRetryable,
   markDeliveryJobFailed,
+  refreshDeliveryJobHeartbeat,
 } from "../../repositories/neon-delivery-jobs.js";
 import { createDeliveryLog } from "../../repositories/neon-delivery-logs.js";
 import { mintDownloadToken } from "../../repositories/neon-download-tokens.js";
@@ -22,55 +25,137 @@ export type DeliveryWorkerDeps = {
   attachMaxBytes: number;
   tokenTtlMinutes: number;
   workerId?: string;
+  leaseDurationSeconds?: number;
+  heartbeatIntervalMs?: number;
+};
+
+export type DeliveryProcessResult = {
+  processed: boolean;
+  jobId?: number;
+  success?: boolean;
+  reason?: string;
+  localOutcome?: "UNKNOWN" | "SUCCESS" | "FAILED";
 };
 
 /**
- * Xử lý 1 delivery job từ hàng đợi Neon delivery_jobs.
+ * Xử lý 1 delivery job từ hàng đợi Neon delivery_jobs theo Delivery Reservation Protocol v7.
  * Thực hiện:
- * - Claim job an toàn bằng FOR UPDATE SKIP LOCKED kèm cơ chế timeout lease
- * - Mint token tải một lần ghi vào Neon
- * - Gửi DM hoặc đính kèm JAR cho người mua qua Discord Bot
- * - Ghi delivery_logs idempotent
- * - Cập nhật orders.delivered_at
+ * 1. ACID Claim Reservation: Lock orders -> Lock delivery_jobs -> Verify Deliverability -> Commit Reservation
+ * 2. Pre-send Checks & Mint Download Token
+ * 3. Heartbeat Timer (60s) bảo vệ Lease trong suốt quá trình I/O
+ * 4. External Discord I/O (At-least-once)
+ * 5. Heartbeat Loss Guard: Nếu mất lease trong lúc I/O -> Dừng toàn bộ DB mutation, localOutcome = 'UNKNOWN'
+ * 6. Commit Thành công: markDeliveryJobSuccess -> Ghi delivery_logs (settled amount snapshot) -> updateOrderStatus('delivered')
  */
 export async function processNextDeliveryJob(
   deps: DeliveryWorkerDeps
-): Promise<{ processed: boolean; jobId?: number; success?: boolean; reason?: string }> {
+): Promise<DeliveryProcessResult> {
   const workerId = deps.workerId || `worker-${process.pid}`;
+  const leaseDurationSeconds = deps.leaseDurationSeconds ?? 300;
+  const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? 60_000;
 
-  // 1. Claim job
-  const job = await claimStaleOrQueuedDeliveryJob(deps.neonDb, workerId, 5);
-  if (!job) {
+  // ==========================================================================
+  // PHA 1: DELIVERY CLAIM TRANSACTION (DELIVERY RESERVATION)
+  // ==========================================================================
+  const claimResult = await deps.neonDb.transaction(async (tx) => {
+    // 1.1. Quét và claim atomic lock
+    const candidate = await claimStaleOrQueuedDeliveryJob(
+      tx,
+      workerId,
+      leaseDurationSeconds
+    );
+    if (!candidate) return null;
+
+    // 1.2. Lock orders tương ứng để xác thực quyền giao hàng
+    const [order] = await tx
+      .select()
+      .from(orders)
+      .where(eq(orders.id, candidate.orderId))
+      .for("update");
+
+    if (!order || (order.status !== "paid" && order.status !== "wallet_paid")) {
+      // Đơn hàng không còn deliverable (đã hủy hoặc hoàn) -> Hủy job
+      await tx
+        .update(deliveryJobs)
+        .set({
+          status: "failed",
+          claimToken: null,
+          lockedAt: null,
+          lastError: "order_not_deliverable",
+          updatedAt: new Date(),
+        })
+        .where(eq(deliveryJobs.id, candidate.id));
+
+      return { job: candidate, deliverable: false, order: null };
+    }
+
+    return { job: candidate, deliverable: true, order };
+  });
+
+  if (!claimResult) {
     return { processed: false };
   }
 
+  const { job, deliverable, order } = claimResult;
   const claimToken = job.claimToken ?? workerId;
 
+  if (!deliverable || !order) {
+    return {
+      processed: true,
+      jobId: job.id,
+      success: false,
+      reason: "order_not_deliverable",
+      localOutcome: "FAILED",
+    };
+  }
+
+  // ==========================================================================
+  // PHA 2: CHUẨN BỊ TỆP & MINT DOWNLOAD TOKEN
+  // ==========================================================================
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  let leaseLost = false;
+
   try {
-    // 2. Tra cứu phiên bản và plugin
     const version = await findVersionById(deps.neonDb, job.versionId);
     if (!version) {
-      await markDeliveryJobFailed(deps.neonDb, job.id, claimToken, "Phiên bản không tồn tại trong Neon");
-      return { processed: true, jobId: job.id, success: false, reason: "version_not_found" };
+      await markDeliveryJobFailed(
+        deps.neonDb,
+        job.id,
+        claimToken,
+        "Phiên bản không tồn tại trong Neon"
+      );
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: "version_not_found",
+        localOutcome: "FAILED",
+      };
     }
 
     const plugin = await findPluginById(deps.neonDb, version.pluginId);
     const pluginSlug = plugin?.slug ?? String(version.pluginId);
     const pluginName = plugin?.displayName ?? version.pluginId.toString();
 
-    // 3. Kiểm tra tệp trong kho đĩa cục bộ
     const blobPath = await resolveBlobPath(deps.vaultDir, version.relPath);
     if (!blobPath) {
       await markDeliveryJobRetryable(
         deps.neonDb,
         job.id,
         claimToken,
-        `Tệp không còn trên đĩa cục bộ: ${version.relPath}`
+        `Tệp không còn trên đĩa cục bộ: ${version.relPath}`,
+        job.retryCount,
+        5
       );
-      return { processed: true, jobId: job.id, success: false, reason: "blob_missing" };
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: "blob_missing",
+        localOutcome: "FAILED",
+      };
     }
 
-    // 4. Tạo download token (1-shot)
     const rawToken = randomBytes(32).toString("base64url");
     const tokenHashHex = createHash("sha256").update(rawToken).digest("hex");
 
@@ -93,56 +178,176 @@ export async function processNextDeliveryJob(
       ? `**${label}**\nTệp đính kèm bên dưới. Liên kết dự phòng (hết hạn sau ${minutes} phút): ${downloadUrl}`
       : `**${label}**\nTệp (${(version.bytes / (1024 * 1024)).toFixed(1)} MB) — tải qua liên kết sau (dùng một lần, hết hạn sau ${minutes} phút):\n${downloadUrl}`;
 
-    // 5. Gửi file / link qua Discord DM
-    let sentMessageId: string | undefined;
+    // ========================================================================
+    // PHA 3: THIẾT LẬP HEARTBEAT & THỰC HIỆN EXTERNAL DISCORD I/O
+    // ========================================================================
+    heartbeatTimer = setInterval(async () => {
+      try {
+        const refreshed = await refreshDeliveryJobHeartbeat(
+          deps.neonDb,
+          job.id,
+          claimToken
+        );
+        if (!refreshed) {
+          leaseLost = true;
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+        }
+      } catch {
+        // Lỗi tạm thời mạng khi heartbeat
+      }
+    }, heartbeatIntervalMs);
+    heartbeatTimer.unref();
+
     try {
       const user = await deps.client.users.fetch(job.discordUserId);
-      const sent = await user.send({
+      await user.send({
         content,
         files: useAttachment ? [new AttachmentBuilder(blobPath, { name: filename })] : [],
       });
-      sentMessageId = sent.id;
     } catch (err) {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+
+      if (leaseLost) {
+        // Quy tắc v7: Mất lease -> Dừng mọi DB mutation, outcome cục bộ là UNKNOWN
+        return {
+          processed: true,
+          jobId: job.id,
+          success: false,
+          reason: "heartbeat_lease_lost",
+          localOutcome: "UNKNOWN",
+        };
+      }
+
       if (
         err instanceof DiscordAPIError &&
         (err.code === RESTJSONErrorCodes.CannotSendMessagesToThisUser ||
           err.code === RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds)
       ) {
-        // DM bị khóa: Không bao giờ hạ trạng thái đơn hàng đã thanh toán thành 'underpaid'
         await markDeliveryJobFailed(deps.neonDb, job.id, claimToken, "dm_blocked");
-        return { processed: true, jobId: job.id, success: false, reason: "dm_blocked" };
+        return {
+          processed: true,
+          jobId: job.id,
+          success: false,
+          reason: "dm_blocked",
+          localOutcome: "FAILED",
+        };
       }
 
-      // Lỗi tạm thời mạng / Discord API -> cho phép retry
       const errMsg = err instanceof Error ? err.message : String(err);
-      await markDeliveryJobRetryable(deps.neonDb, job.id, claimToken, errMsg);
-      return { processed: true, jobId: job.id, success: false, reason: errMsg };
+      await markDeliveryJobRetryable(
+        deps.neonDb,
+        job.id,
+        claimToken,
+        errMsg,
+        job.retryCount,
+        5
+      );
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: errMsg,
+        localOutcome: "FAILED",
+      };
     }
 
-    // 6. Ghi nhận giao dịch thành công
-    await markDeliveryJobSuccess(deps.neonDb, job.id, claimToken);
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
 
-    // Ghi delivery_logs idempotent
+    // ========================================================================
+    // PHA 4: KIỂM TRA MẤT LEASE TRƯỚC KHI MUTATE CƠ SỞ DỮ LIỆU
+    // ========================================================================
+    if (leaseLost) {
+      // Invariant v7: Heartbeat lost -> DỪNG TOÀN BỘ DB MUTATION
+      // Không ghi markSuccess, không update order, không ghi log
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: "heartbeat_lease_lost",
+        localOutcome: "UNKNOWN",
+      };
+    }
+
+    // Ghi nhận thành công vào delivery_jobs
+    const marked = await markDeliveryJobSuccess(deps.neonDb, job.id, claimToken);
+    if (!marked) {
+      // Bị cướp claim / mất lease ở thời điểm chốt -> Dừng mutation
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: "claim_lost_at_completion",
+        localOutcome: "UNKNOWN",
+      };
+    }
+
+    // ========================================================================
+    // PHA 5: GHI NHẬN AUDIT & CẬP NHẬT TRẠNG THÁI ORDER
+    // ========================================================================
+    // Snapshot giá trị tất toán thực tế của đơn hàng (Phase 3B snapshot)
+    const settledAmount =
+      (order.walletPaid ?? 0) +
+      (order.paidAmount ?? (order.status === "wallet_paid" ? 0 : order.bankDue));
+
     await createDeliveryLog(deps.neonDb, {
       orderId: job.orderId,
       discordUserId: job.discordUserId,
       versionId: job.versionId,
       pluginName,
       versionLabel: version.version ?? "",
-      amount: 0,
+      amount: settledAmount,
       requestedMethod: job.requestedMethod,
       actualMethod: useAttachment ? "attachment" : "link",
-      deliveryIdempotencyKey: `order_${job.orderId}_${job.requestedMethod}`,
+      deliveryIdempotencyKey: `order_${job.orderId}_${job.requestedMethod}_${job.externalAttemptCount}`,
       deliveredAt: new Date(),
     });
 
-    // Cập nhật đơn hàng thành delivered
+    // Cập nhật đơn hàng thành delivered (Có State Guard bảo vệ ở repository)
     await updateOrderStatus(deps.neonDb, job.orderId, "delivered");
 
-    return { processed: true, jobId: job.id, success: true };
+    return {
+      processed: true,
+      jobId: job.id,
+      success: true,
+      localOutcome: "SUCCESS",
+    };
   } catch (unexpectedErr) {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+
+    if (leaseLost) {
+      return {
+        processed: true,
+        jobId: job.id,
+        success: false,
+        reason: "heartbeat_lease_lost",
+        localOutcome: "UNKNOWN",
+      };
+    }
+
     const msg = unexpectedErr instanceof Error ? unexpectedErr.message : String(unexpectedErr);
-    await markDeliveryJobRetryable(deps.neonDb, job.id, claimToken, `Lỗi không mong muốn: ${msg}`);
-    return { processed: true, jobId: job.id, success: false, reason: msg };
+    await markDeliveryJobRetryable(
+      deps.neonDb,
+      job.id,
+      claimToken,
+      `Lỗi không mong muốn: ${msg}`,
+      job.retryCount,
+      5
+    );
+    return {
+      processed: true,
+      jobId: job.id,
+      success: false,
+      reason: msg,
+      localOutcome: "FAILED",
+    };
   }
 }

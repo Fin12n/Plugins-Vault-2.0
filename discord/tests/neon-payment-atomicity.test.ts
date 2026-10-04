@@ -334,6 +334,28 @@ function createMockNeonDb() {
       }
     },
 
+    delete: (table: any) => ({
+      where: (cond: any) => {
+        const doDelete = () => {
+          const tableName = getTableName(table);
+          const vals = extractValues(cond);
+          if (tableName === "download_tokens") {
+            const targetOrderId = vals.find((v) => typeof v === "number");
+            for (const [k, v] of Array.from(downloadTokens.entries())) {
+              if (targetOrderId === undefined || v.orderId === targetOrderId) {
+                downloadTokens.delete(k);
+              }
+            }
+          }
+          return [];
+        };
+        return {
+          returning: () => doDelete(),
+          then: (resolve: any) => resolve(doDelete()),
+        };
+      },
+    }),
+
     execute: async (query: any) => {
       return { rows: [] };
     },

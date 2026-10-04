@@ -1,4 +1,4 @@
-import { eq, desc, and, lt, or, isNull } from "drizzle-orm";
+import { eq, desc, and, lt, or, isNull, inArray } from "drizzle-orm";
 import type { Database } from "../db/neon.js";
 import {
   orders,
@@ -9,6 +9,11 @@ import {
   type NewOrder,
 } from "@vault/db";
 import { applyLedgerEntryTx } from "./neon-wallets.js";
+import { revokeDownloadTokensByOrder } from "./neon-download-tokens.js";
+import {
+  findActiveDeliveryJobByOrderId,
+  cancelDeliveryJobsByOrder,
+} from "./neon-delivery-jobs.js";
 
 type DbOrTx = Parameters<Parameters<Database["transaction"]>[0]>[0] | Database;
 
@@ -54,6 +59,8 @@ export async function findOrderById(
 
 /**
  * Cập nhật trạng thái đơn hàng khi SePay báo đã thanh toán hoặc giao hàng.
+ * Áp dụng State Guard: status 'delivered' chỉ được phép chuyển từ 'paid' hoặc 'wallet_paid'.
+ * Tuyệt đối không ghi đè lên các đơn đã 'refunded' hoặc 'cancelled'.
  */
 export async function updateOrderStatus(
   db: DbOrTx,
@@ -65,7 +72,16 @@ export async function updateOrderStatus(
   const patch: Partial<NewOrder> = { status };
   if (paidAmount !== undefined) patch.paidAmount = paidAmount;
   if (status === "paid" || status === "wallet_paid") patch.paidAt = now;
-  if (status === "delivered") patch.deliveredAt = now;
+
+  if (status === "delivered") {
+    patch.deliveredAt = now;
+    const updated = await db
+      .update(orders)
+      .set(patch)
+      .where(and(eq(orders.id, id), inArray(orders.status, ["paid", "wallet_paid"])))
+      .returning();
+    return updated[0] ?? null;
+  }
 
   const updated = await db
     .update(orders)
@@ -303,6 +319,28 @@ export async function refundOrderWallet(
       );
     }
 
+    // 3.1. Check Active Delivery Job (Delivery Reservation Protocol v7)
+    const activeJob = await findActiveDeliveryJobByOrderId(tx, orderId);
+
+    if (activeJob) {
+      if (activeJob.status === "processing") {
+        throw new Error(
+          `DELIVERY_IN_PROGRESS: Đơn hàng #${orderId} đang trong tiến trình chuyển phát, không thể hoàn tiền`
+        );
+      }
+
+      if (
+        activeJob.status === "queued" ||
+        activeJob.status === "retryable" ||
+        activeJob.status === "failed"
+      ) {
+        await cancelDeliveryJobsByOrder(tx, orderId);
+      }
+    }
+
+    // 3.2. Thu hồi toàn bộ liên kết tải chưa dùng của đơn hàng trên Neon
+    await revokeDownloadTokensByOrder(tx, orderId);
+
     // 4. Calculate actual refund amount
     const bankReceived =
       lockedOrder.paidAmount ??
@@ -384,7 +422,7 @@ export async function cancelPendingOrder(
     }
 
     if (pre.walletPaid > 0) {
-      // Case B: Có giữ coin -> Lock wallets -> Lock orders
+      // Case B: Có giữ coin -> Lock wallets -> Lock orders -> Check delivery reservation
       await tx
         .insert(wallets)
         .values({
@@ -409,6 +447,27 @@ export async function cancelPendingOrder(
       if (!lockedOrder || lockedOrder.status !== "pending") {
         throw new Error(`Đơn hàng #${orderId} không còn ở trạng thái pending`);
       }
+
+      // Check Active Delivery Job (Delivery Reservation Protocol v7)
+      const activeJob = await findActiveDeliveryJobByOrderId(tx, orderId);
+
+      if (activeJob) {
+        if (activeJob.status === "processing") {
+          throw new Error(
+            `DELIVERY_IN_PROGRESS: Đơn hàng #${orderId} đang trong tiến trình chuyển phát, không thể hủy đơn`
+          );
+        }
+
+        if (
+          activeJob.status === "queued" ||
+          activeJob.status === "retryable" ||
+          activeJob.status === "failed"
+        ) {
+          await cancelDeliveryJobsByOrder(tx, orderId);
+        }
+      }
+
+      await revokeDownloadTokensByOrder(tx, orderId);
 
       const refundCoins = lockedOrder.walletPaid;
       const newBalance = (lockedWallet?.balance ?? 0) + refundCoins;
@@ -443,7 +502,7 @@ export async function cancelPendingOrder(
 
       return { order: cancelled!, refundedCoins: refundCoins };
     } else {
-      // Case A: walletPaid === 0 -> Lock orders -> Cancelled
+      // Case A: walletPaid === 0 -> Lock orders -> Check delivery reservation -> Cancelled
       const [lockedOrder] = await tx
         .select()
         .from(orders)
@@ -453,6 +512,27 @@ export async function cancelPendingOrder(
       if (!lockedOrder || lockedOrder.status !== "pending") {
         throw new Error(`Đơn hàng #${orderId} không còn ở trạng thái pending`);
       }
+
+      // Check Active Delivery Job (Delivery Reservation Protocol v7)
+      const activeJob = await findActiveDeliveryJobByOrderId(tx, orderId);
+
+      if (activeJob) {
+        if (activeJob.status === "processing") {
+          throw new Error(
+            `DELIVERY_IN_PROGRESS: Đơn hàng #${orderId} đang trong tiến trình chuyển phát, không thể hủy đơn`
+          );
+        }
+
+        if (
+          activeJob.status === "queued" ||
+          activeJob.status === "retryable" ||
+          activeJob.status === "failed"
+        ) {
+          await cancelDeliveryJobsByOrder(tx, orderId);
+        }
+      }
+
+      await revokeDownloadTokensByOrder(tx, orderId);
 
       const [cancelled] = await tx
         .update(orders)
