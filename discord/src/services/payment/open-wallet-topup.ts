@@ -94,7 +94,10 @@ export async function openWalletTopupNeon(
         amount: topup.amount,
         code: topup.code,
       }),
-      expiresAt: topup.expiresAt,
+      expiresAt:
+        topup.expiresAt instanceof Date
+          ? Math.floor(topup.expiresAt.getTime() / 1000)
+          : Number(topup.expiresAt),
     };
   }
   return null;

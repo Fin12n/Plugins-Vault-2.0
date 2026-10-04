@@ -17,7 +17,8 @@ import { denominationsFor, TELCO_LABELS, TELCOS, type Telco } from '../../servic
 import { submitCardTopup, type SubmitRejection } from '../../services/card/submit-card-topup.js';
 import { getBalance, listLedger } from '../../repositories/wallets.js';
 import { getNeonDb } from '../../db/neon.js';
-import { getWalletBalance, listLedgerEntries } from '../../repositories/neon-wallets.js';
+import { getWalletBalance, listLedger as listLedgerNeon } from '../../repositories/neon-wallets.js';
+import type { WalletLedgerEntry } from '@vault/db';
 import { openWalletTopup, openWalletTopupNeon } from '../../services/payment/open-wallet-topup.js';
 import { botVi, formatVnd } from '../i18n/bot-vi.js';
 import {
@@ -86,8 +87,8 @@ export async function handleWalletCommand(
   let recent: any[];
   if (neonDb) {
     balance = await getWalletBalance(neonDb, interaction.user.id);
-    const ledger = await listLedgerEntries(neonDb, interaction.user.id, 5);
-    recent = ledger.map((l) => ({
+    const ledger = await listLedgerNeon(neonDb, interaction.user.id, 5);
+    recent = ledger.map((l: WalletLedgerEntry) => ({
       delta: l.delta,
       kind: l.kind,
       description: l.note || '',

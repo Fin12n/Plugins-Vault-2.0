@@ -145,6 +145,7 @@ export function registerSepayWebhook(
           );
           return reply;
         }
+        const delivery = deps.delivery;
         if (deps.neonDb) {
           void processNextDeliveryJob({
             neonDb: deps.neonDb,
