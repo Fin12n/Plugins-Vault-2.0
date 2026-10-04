@@ -15,27 +15,25 @@ import {
 import { applyLedgerEntryTx } from "../../repositories/neon-wallets.js";
 import { findOrderByCode } from "../../repositories/neon-orders.js";
 import { findTopupByCode } from "../../repositories/neon-wallet-topups.js";
-import { recordSepayTransaction, hasSepayTransaction } from "../../repositories/neon-sepay.js";
+import { isTerminalSepayStatus } from "../../repositories/neon-sepay.js";
 import { assertNotFrozen } from "../maintenance/write-freeze.js";
-import { generatePaymentCode, buildVietQrUrl } from "./build-vietqr-url.js";
-import { isCodeAvailableNeon } from "./open-wallet-topup.js";
+import type { WebhookOutcome, OrderConfig } from "./match-and-fulfil-order.js";
 import { findVersionById } from "../../repositories/neon-versions.js";
 import { findPluginById } from "../../repositories/neon-plugins.js";
-import type { OrderConfig } from "./match-and-fulfil-order.js";
+import { generatePaymentCode, buildVietQrUrl } from "./build-vietqr-url.js";
+import { isCodeAvailableNeon } from "./open-wallet-topup.js";
 
-export type WebhookOutcome =
-  | { handled: "duplicate" }
-  | { handled: "ignored"; why: "outgoing" | "no-code" | "no-order" | "underpaid" | "not-pending" }
-  | { handled: "paid"; orderId: number }
-  | { handled: "topup"; topupId: number; discordUserId: string; credited: number };
+type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
+export type { WebhookOutcome };
 
 /**
  * Xử lý giao dịch SePay Webhook trực tiếp trên Neon PostgreSQL authority.
  * Tuân thủ nghiêm ngặt:
- * 1. Canonical Lock Order (wallets -> orders -> wallet_topups -> delivery_jobs)
- * 2. Invariant chk_sepay_target_exclusivity
- * 3. Dynamic Real-Amount Credit Policy cho Wallet Topup
- * 4. Append-only ledger với mọi biến động số dư ví
+ * 1. Single Transaction Boundary: Toàn bộ quá trình ingestion, row lock, wallet mutation, order mutation và job enqueue nằm trong đúng một transaction.
+ * 2. First-Insert Race Guard: INSERT ... ON CONFLICT DO NOTHING + SELECT ... FOR UPDATE.
+ * 3. Canonical Lock Order: sepay_transactions -> wallets -> orders -> wallet_topups -> delivery_jobs.
+ * 4. State-Lock Before Financial Mutation: Khóa ví và đối tượng nghiệp vụ, reload fresh state trước khi phân nhánh hoặc ghi ledger.
+ * 5. Dynamic Real-Amount Credit Policy cho Wallet Topup.
  */
 export async function applySepayTransferNeon(
   db: Database,
@@ -43,370 +41,425 @@ export async function applySepayTransferNeon(
 ): Promise<WebhookOutcome> {
   assertNotFrozen("Xử lý thanh toán SePay");
 
-  // 1. Idempotency Guard (Deduplication trước tiên)
-  const alreadyProcessed = await hasSepayTransaction(db, payload.id);
-  if (alreadyProcessed) {
-    return { handled: "duplicate" };
-  }
+  return await db.transaction(async (tx) => {
+    // 1. First-Insert Race Guard & Row Lock Ownership
+    const inserted = await tx
+      .insert(sepayTransactions)
+      .values({
+        sepayId: payload.id,
+        amount: payload.transferAmount,
+        transferType: payload.transferType,
+        code: payload.code,
+        content: payload.content || "",
+        description: payload.description || "",
+        status: "unmatched",
+        orderId: null,
+        topupId: null,
+        rawPayload: payload as unknown as Record<string, unknown>,
+        receivedAt: new Date(),
+      })
+      .onConflictDoNothing({ target: sepayTransactions.sepayId })
+      .returning();
 
-  // 2. Ghi nhận sepay_transactions ban đầu (status: unmatched, orderId: null, topupId: null)
-  let sepayRow: SepayTransaction;
-  try {
-    sepayRow = await recordSepayTransaction(db, {
-      sepayId: payload.id,
-      amount: payload.transferAmount,
-      transferType: payload.transferType,
-      code: payload.code,
-      content: payload.content || "",
-      description: payload.description || "",
-      status: "unmatched",
-      orderId: null,
-      topupId: null,
-      rawPayload: payload as unknown as Record<string, unknown>,
-      receivedAt: new Date(),
-    });
-  } catch (err) {
-    // Nếu bị trùng unique sepay_id do concurrent request
-    return { handled: "duplicate" };
-  }
+    let sepayRow: SepayTransaction;
 
-  // 3. Kiểm tra loại giao dịch (Chỉ nhận tiền vào - 'in')
-  if (payload.transferType !== "in") {
-    await db
+    if (inserted.length > 0 && inserted[0]) {
+      // Winner: Transaction hiện tại sở hữu bản ghi vừa tạo
+      sepayRow = inserted[0];
+    } else {
+      // Loser hoặc Retry: Bị xung đột unique constraint -> Lock hàng đang có để kiểm tra trạng thái
+      const [existing] = await tx
+        .select()
+        .from(sepayTransactions)
+        .where(eq(sepayTransactions.sepayId, payload.id))
+        .for("update");
+
+      if (!existing) {
+        throw new Error(`CRITICAL: Không tìm thấy sepay_id #${payload.id} sau khi conflict`);
+      }
+
+      if (isTerminalSepayStatus(existing.status)) {
+        return { handled: "duplicate" };
+      }
+
+      // Non-terminal ('unmatched', 'received') -> Tiếp tục Resume đối soát trong cùng transaction
+      sepayRow = existing;
+    }
+
+    // 2. Lifecycle Phân loại Terminal cho giao dịch chuyển đi (outgoing)
+    if (payload.transferType !== "in") {
+      await tx
+        .update(sepayTransactions)
+        .set({
+          status: "ignored_outgoing",
+          description: "Giao dịch chuyển tiền đi (outgoing), bỏ qua",
+        })
+        .where(eq(sepayTransactions.id, sepayRow.id));
+      return { handled: "ignored", why: "outgoing" };
+    }
+
+    // 3. Lifecycle Phân loại Terminal cho giao dịch không có mã chuyển khoản (no-code)
+    if (!payload.code || payload.code.trim() === "") {
+      await tx
+        .update(sepayTransactions)
+        .set({
+          status: "ignored_no_code",
+          description: "Không nhận dạng được mã thanh toán (no-code)",
+        })
+        .where(eq(sepayTransactions.id, sepayRow.id));
+      return { handled: "ignored", why: "no-code" };
+    }
+
+    const cleanCode = payload.code.trim().toUpperCase();
+
+    // 4. Pre-read để xác định đối tượng liên kết (Precedence: Orders -> Topups)
+    const orderPre = await findOrderByCode(tx, cleanCode);
+    if (orderPre) {
+      return await handleOrderPaymentNeonTx(tx, payload, sepayRow, orderPre);
+    }
+
+    const topupPre = await findTopupByCode(tx, cleanCode);
+    if (topupPre) {
+      return await handleTopupPaymentNeonTx(tx, payload, sepayRow, topupPre);
+    }
+
+    // 5. Non-terminal: Không tìm thấy Order hay Topup tương ứng -> lưu unmatched chờ đối soát
+    await tx
       .update(sepayTransactions)
-      .set({ description: "Giao dịch chuyển tiền đi (outgoing), bỏ qua" })
+      .set({
+        status: "unmatched",
+        description: `Không tìm thấy đơn hàng hoặc yêu cầu nạp ví cho mã: ${cleanCode}`,
+      })
       .where(eq(sepayTransactions.id, sepayRow.id));
-    return { handled: "ignored", why: "outgoing" };
-  }
 
-  // 4. Kiểm tra mã chuyển khoản (code)
-  if (!payload.code || payload.code.trim() === "") {
-    await db
-      .update(sepayTransactions)
-      .set({ description: "Không nhận dạng được mã thanh toán (no-code)" })
-      .where(eq(sepayTransactions.id, sepayRow.id));
-    return { handled: "ignored", why: "no-code" };
-  }
-
-  const cleanCode = payload.code.trim().toUpperCase();
-
-  // 5. Tìm kiếm đơn hàng trước (Precedence: Orders -> Topups)
-  const order = await findOrderByCode(db, cleanCode);
-
-  if (order) {
-    return await handleOrderPaymentNeon(db, payload, sepayRow, order);
-  }
-
-  // 6. Nếu không khớp Order, tìm Topup
-  const topup = await findTopupByCode(db, cleanCode);
-  if (topup) {
-    return await handleTopupPaymentNeon(db, payload, sepayRow, topup);
-  }
-
-  // 7. Không tìm thấy cả Order lẫn Topup
-  await db
-    .update(sepayTransactions)
-    .set({
-      description: `Không tìm thấy đơn hàng hoặc yêu cầu nạp ví cho mã: ${cleanCode}`,
-    })
-    .where(eq(sepayTransactions.id, sepayRow.id));
-
-  return { handled: "ignored", why: "no-order" };
+    return { handled: "ignored", why: "no-order" };
+  });
 }
 
 /**
- * Xử lý thanh toán cho Order trên Neon PostgreSQL.
+ * Xử lý thanh toán Order trong SAME transaction với SePay lock.
+ * Tuân thủ Invariant B: State-Lock Before Financial Mutation.
  */
-async function handleOrderPaymentNeon(
-  db: Database,
+async function handleOrderPaymentNeonTx(
+  tx: Tx,
   payload: SepayWebhookPayload,
   sepayRow: SepayTransaction,
-  order: Order
+  orderPre: Order
 ): Promise<WebhookOutcome> {
   const transferAmount = payload.transferAmount;
 
-  return await db.transaction(async (tx) => {
-    // Trường hợp A: Đơn hàng không còn ở trạng thái pending
-    if (order.status !== "pending") {
-      if (order.status === "paid" || order.status === "wallet_paid" || order.status === "delivered") {
-        // Đơn đã thanh toán từ trước -> hoàn toàn bộ số tiền vừa nhận vào ví
-        // Canonical Lock: Lock wallets (2) -> Lock orders (3)
-        await applyLedgerEntryTx(tx, {
-          discordUserId: order.discordUserId,
-          delta: transferAmount,
-          kind: "order_overpay_credit",
-          refType: "sepay_transactions",
-          refId: sepayRow.id,
-          note: `Chuyển khoản cho đơn hàng #${order.code} đã thanh toán`,
-        });
+  // Step 2: Lock wallets FIRST với FOR UPDATE
+  await tx
+    .insert(wallets)
+    .values({
+      discordUserId: orderPre.discordUserId,
+      balance: 0,
+      updatedAt: new Date(),
+    })
+    .onConflictDoNothing({ target: wallets.discordUserId });
 
-        await tx.select().from(orders).where(eq(orders.id, order.id)).for("update");
+  const [lockedWallet] = await tx
+    .select()
+    .from(wallets)
+    .where(eq(wallets.discordUserId, orderPre.discordUserId))
+    .for("update");
 
-        await tx
-          .update(sepayTransactions)
-          .set({
-            status: "overpaid",
-            orderId: order.id,
-            topupId: null,
-            processedAt: new Date(),
-            description: "Chuyển khoản cho đơn đã thanh toán - đã nạp toàn bộ vào ví",
-          })
-          .where(eq(sepayTransactions.id, sepayRow.id));
-      } else if (order.status === "expired") {
-        // Đơn đã hết hạn -> nạp toàn bộ số tiền vào ví
-        await applyLedgerEntryTx(tx, {
-          discordUserId: order.discordUserId,
-          delta: transferAmount,
-          kind: "order_overpay_credit",
-          refType: "sepay_transactions",
-          refId: sepayRow.id,
-          note: `Chuyển khoản cho đơn hàng #${order.code} đã hết hạn`,
-        });
+  if (!lockedWallet) {
+    throw new Error(`Ví của user ${orderPre.discordUserId} không tìm thấy`);
+  }
 
-        await tx.select().from(orders).where(eq(orders.id, order.id)).for("update");
+  // Step 3: Lock orders NEXT với FOR UPDATE & RELOAD FRESH STATE
+  const [freshOrder] = await tx
+    .select()
+    .from(orders)
+    .where(eq(orders.id, orderPre.id))
+    .for("update");
 
-        await tx
-          .update(sepayTransactions)
-          .set({
-            status: "overpaid",
-            orderId: order.id,
-            topupId: null,
-            processedAt: new Date(),
-            description: "Chuyển khoản cho đơn đã hết hạn - đã nạp vào ví",
-          })
-          .where(eq(sepayTransactions.id, sepayRow.id));
-      }
+  if (!freshOrder) {
+    throw new Error(`Order #${orderPre.id} không tìm thấy khi lock`);
+  }
 
-      return { handled: "ignored", why: "not-pending" };
-    }
+  // Step 4: Business State Decision & Financial Mutation
+  // Trường hợp A: Đơn hàng không còn ở trạng thái pending (paid, wallet_paid, delivered, expired, cancelled, refunded)
+  if (freshOrder.status !== "pending") {
+    // Không reopen order. Nạp toàn bộ 100% số tiền thực nhận vào ví người dùng
+    const newBalance = lockedWallet.balance + transferAmount;
+    await tx
+      .update(wallets)
+      .set({
+        balance: newBalance,
+        updatedAt: new Date(),
+      })
+      .where(eq(wallets.discordUserId, freshOrder.discordUserId));
 
-    // Trường hợp B: Đơn hàng đang pending
-    const bankDue = order.amount; // hoặc phần tiền cần thanh toán
-
-    if (transferAmount < bankDue) {
-      // B1: Thiếu tiền (Underpayment)
-      // Step 2: Lock wallets -> nạp phần tiền thiếu vào ví
-      await applyLedgerEntryTx(tx, {
-        discordUserId: order.discordUserId,
-        delta: transferAmount,
-        kind: "order_partial_credit",
-        refType: "sepay_transactions",
-        refId: sepayRow.id,
-        note: `Chuyển khoản thiếu cho đơn hàng #${order.code} (cần: ${bankDue}đ, nhận: ${transferAmount}đ)`,
-      });
-
-      // Step 3: Lock orders -> order giữ nguyên status pending
-      await tx.select().from(orders).where(eq(orders.id, order.id)).for("update");
-
-      // Cập nhật sepay_transactions
-      await tx
-        .update(sepayTransactions)
-        .set({
-          status: "underpaid",
-          orderId: order.id,
-          topupId: null,
-          processedAt: new Date(),
-          description: `Thanh toán thiếu: nhận ${transferAmount}đ / ${bankDue}đ`,
-        })
-        .where(eq(sepayTransactions.id, sepayRow.id));
-
-      return { handled: "ignored", why: "underpaid" };
-    }
-
-    if (transferAmount === bankDue) {
-      // B2: Khớp đúng số tiền (Exact Payment)
-      // Không cần lock ví vì không có biến động ví
-      // Step 3: Lock orders -> đánh dấu paid
-      const lockedOrders = await tx
-        .select()
-        .from(orders)
-        .where(eq(orders.id, order.id))
-        .for("update");
-
-      const lockedOrder = lockedOrders[0];
-      if (!lockedOrder || lockedOrder.status !== "pending") {
-        return { handled: "ignored", why: "not-pending" };
-      }
-
-      await tx
-        .update(orders)
-        .set({
-          status: "paid",
-          paidAmount: transferAmount,
-          paidAt: new Date(),
-        })
-        .where(eq(orders.id, order.id));
-
-      // Step 5: Enqueue delivery_job
-      if (order.versionId) {
-        await tx
-          .insert(deliveryJobs)
-          .values({
-            orderId: order.id,
-            discordUserId: order.discordUserId,
-            versionId: order.versionId,
-            requestedMethod: "dm",
-            status: "queued",
-          })
-          .onConflictDoNothing();
-      }
-
-      // Cập nhật sepay_transactions
-      await tx
-        .update(sepayTransactions)
-        .set({
-          status: "credited",
-          orderId: order.id,
-          topupId: null,
-          processedAt: new Date(),
-          description: `Thanh toán thành công đơn hàng #${order.code}`,
-        })
-        .where(eq(sepayTransactions.id, sepayRow.id));
-
-      return { handled: "paid", orderId: order.id };
-    }
-
-    // B3: Chuyển thừa tiền (Overpayment)
-    const surplus = transferAmount - bankDue;
-
-    // Step 2: Lock wallets -> nạp phần dư vào ví
-    await applyLedgerEntryTx(tx, {
-      discordUserId: order.discordUserId,
-      delta: surplus,
+    await tx.insert(walletLedger).values({
+      discordUserId: freshOrder.discordUserId,
+      delta: transferAmount,
+      balanceAfter: newBalance,
       kind: "order_overpay_credit",
       refType: "sepay_transactions",
       refId: sepayRow.id,
-      note: `Chuyển khoản thừa đơn hàng #${order.code} (dư ${surplus}đ)`,
+      note: `Chuyển khoản cho đơn hàng #${freshOrder.code} ở trạng thái '${freshOrder.status}' - đã nạp 100% vào ví`,
     });
 
-    // Step 3: Lock orders -> cập nhật status paid
-    const lockedOrders = await tx
-      .select()
-      .from(orders)
-      .where(eq(orders.id, order.id))
-      .for("update");
+    await tx
+      .update(sepayTransactions)
+      .set({
+        status: "overpaid",
+        orderId: freshOrder.id,
+        topupId: null,
+        processedAt: new Date(),
+        description: `Chuyển khoản cho đơn '${freshOrder.status}' - đã nạp vào ví`,
+      })
+      .where(eq(sepayTransactions.id, sepayRow.id));
 
-    const lockedOrder = lockedOrders[0];
-    if (!lockedOrder || lockedOrder.status !== "pending") {
-      return { handled: "ignored", why: "not-pending" };
-    }
+    return { handled: "ignored", why: "not-pending" };
+  }
 
+  // Trường hợp B: Đơn hàng đang pending
+  const bankDue =
+    freshOrder.bankDue ?? (freshOrder.amount - (freshOrder.walletPaid ?? 0));
+
+  if (transferAmount < bankDue) {
+    // B1: Thiếu tiền (Underpayment)
+    // Nạp phần tiền thiếu vào ví khách, đơn giữ nguyên pending
+    const newBalance = lockedWallet.balance + transferAmount;
+    await tx
+      .update(wallets)
+      .set({
+        balance: newBalance,
+        updatedAt: new Date(),
+      })
+      .where(eq(wallets.discordUserId, freshOrder.discordUserId));
+
+    await tx.insert(walletLedger).values({
+      discordUserId: freshOrder.discordUserId,
+      delta: transferAmount,
+      balanceAfter: newBalance,
+      kind: "order_partial_credit",
+      refType: "sepay_transactions",
+      refId: sepayRow.id,
+      note: `Chuyển khoản thiếu cho đơn hàng #${freshOrder.code} (cần: ${bankDue}đ, nhận: ${transferAmount}đ)`,
+    });
+
+    await tx
+      .update(sepayTransactions)
+      .set({
+        status: "underpaid",
+        orderId: freshOrder.id,
+        topupId: null,
+        processedAt: new Date(),
+        description: `Thanh toán thiếu: nhận ${transferAmount}đ / ${bankDue}đ`,
+      })
+      .where(eq(sepayTransactions.id, sepayRow.id));
+
+    return { handled: "ignored", why: "underpaid" };
+  }
+
+  if (transferAmount === bankDue) {
+    // B2: Khớp đúng số tiền (Exact Payment)
+    // Không biến động ví vì không thừa/thiếu
     await tx
       .update(orders)
       .set({
         status: "paid",
-        paidAmount: bankDue,
+        paidAmount: transferAmount,
         paidAt: new Date(),
       })
-      .where(eq(orders.id, order.id));
+      .where(eq(orders.id, freshOrder.id));
 
     // Step 5: Enqueue delivery_job
-    if (order.versionId) {
+    if (freshOrder.versionId) {
       await tx
         .insert(deliveryJobs)
         .values({
-          orderId: order.id,
-          discordUserId: order.discordUserId,
-          versionId: order.versionId,
+          orderId: freshOrder.id,
+          discordUserId: freshOrder.discordUserId,
+          versionId: freshOrder.versionId,
           requestedMethod: "dm",
           status: "queued",
         })
         .onConflictDoNothing();
     }
 
-    // Cập nhật sepay_transactions
     await tx
       .update(sepayTransactions)
       .set({
-        status: "overpaid",
-        orderId: order.id,
+        status: "credited",
+        orderId: freshOrder.id,
         topupId: null,
         processedAt: new Date(),
-        description: `Thanh toán đơn hàng #${order.code} thành công kèm nạp thừa ${surplus}đ vào ví`,
+        description: `Thanh toán thành công đơn hàng #${freshOrder.code}`,
       })
       .where(eq(sepayTransactions.id, sepayRow.id));
 
-    return { handled: "paid", orderId: order.id };
+    return { handled: "paid", orderId: freshOrder.id };
+  }
+
+  // B3: Chuyển thừa tiền (Overpayment)
+  const surplus = transferAmount - bankDue;
+  const newBalance = lockedWallet.balance + surplus;
+
+  await tx
+    .update(wallets)
+    .set({
+      balance: newBalance,
+      updatedAt: new Date(),
+    })
+    .where(eq(wallets.discordUserId, freshOrder.discordUserId));
+
+  await tx.insert(walletLedger).values({
+    discordUserId: freshOrder.discordUserId,
+    delta: surplus,
+    balanceAfter: newBalance,
+    kind: "order_overpay_credit",
+    refType: "sepay_transactions",
+    refId: sepayRow.id,
+    note: `Chuyển khoản thừa đơn hàng #${freshOrder.code} (dư ${surplus}đ)`,
   });
+
+  await tx
+    .update(orders)
+    .set({
+      status: "paid",
+      paidAmount: bankDue,
+      paidAt: new Date(),
+    })
+    .where(eq(orders.id, freshOrder.id));
+
+  // Step 5: Enqueue delivery_job
+  if (freshOrder.versionId) {
+    await tx
+      .insert(deliveryJobs)
+      .values({
+        orderId: freshOrder.id,
+        discordUserId: freshOrder.discordUserId,
+        versionId: freshOrder.versionId,
+        requestedMethod: "dm",
+        status: "queued",
+      })
+      .onConflictDoNothing();
+  }
+
+  await tx
+    .update(sepayTransactions)
+    .set({
+      status: "overpaid",
+      orderId: freshOrder.id,
+      topupId: null,
+      processedAt: new Date(),
+      description: `Thanh toán đơn hàng #${freshOrder.code} thành công kèm nạp thừa ${surplus}đ vào ví`,
+    })
+    .where(eq(sepayTransactions.id, sepayRow.id));
+
+  return { handled: "paid", orderId: freshOrder.id };
 }
 
 /**
- * Xử lý nạp tiền ví qua SePay trên Neon PostgreSQL (Dynamic Real-Amount Credit Policy).
- * Áp dụng giống nhau cho cả topup đang 'pending' và 'expired'.
+ * Xử lý nạp tiền ví qua SePay trong SAME transaction với SePay lock.
+ * Tuân thủ Invariant B: State-Lock Before Financial Mutation.
  */
-async function handleTopupPaymentNeon(
-  db: Database,
+async function handleTopupPaymentNeonTx(
+  tx: Tx,
   payload: SepayWebhookPayload,
   sepayRow: SepayTransaction,
-  topup: WalletTopup
+  topupPre: WalletTopup
 ): Promise<WebhookOutcome> {
   const receivedAmount = payload.transferAmount;
 
-  if (topup.status === "credited") {
-    // Đã được xử lý trước đó
-    await db
+  // Step 2: Lock wallets FIRST
+  await tx
+    .insert(wallets)
+    .values({
+      discordUserId: topupPre.discordUserId,
+      balance: 0,
+      updatedAt: new Date(),
+    })
+    .onConflictDoNothing({ target: wallets.discordUserId });
+
+  const [lockedWallet] = await tx
+    .select()
+    .from(wallets)
+    .where(eq(wallets.discordUserId, topupPre.discordUserId))
+    .for("update");
+
+  if (!lockedWallet) {
+    throw new Error(`Ví của user ${topupPre.discordUserId} không tìm thấy`);
+  }
+
+  // Step 4: Lock wallet_topups NEXT & RELOAD FRESH STATE
+  const [freshTopup] = await tx
+    .select()
+    .from(walletTopups)
+    .where(eq(walletTopups.id, topupPre.id))
+    .for("update");
+
+  if (!freshTopup) {
+    throw new Error(`Topup #${topupPre.id} không tìm thấy khi lock`);
+  }
+
+  // Kiểm tra trạng thái hiện tại sau khi đã chiếm được Lock
+  if (freshTopup.status === "credited") {
+    // Phiếu nạp đã được giải ngân bởi giao dịch khác -> TUYỆT ĐỐI KHÔNG CỘNG TIỀN LẦN 2
+    await tx
       .update(sepayTransactions)
       .set({
         status: "duplicate_transfer",
-        topupId: topup.id,
+        topupId: freshTopup.id,
         orderId: null,
         description: "Yêu cầu nạp ví này đã được hoàn tất trước đó",
       })
       .where(eq(sepayTransactions.id, sepayRow.id));
-    return { handled: "ignored", why: "not-pending" };
+    return { handled: "duplicate" };
   }
 
-  return await db.transaction(async (tx) => {
-    // Step 2: Lock wallets FIRST -> cộng đúng số tiền thực nhận
-    await applyLedgerEntryTx(tx, {
-      discordUserId: topup.discordUserId,
-      delta: receivedAmount,
-      kind: "topup_credit",
-      refType: "wallet_topups",
-      refId: topup.id,
-      note: `Nạp tiền ví qua SePay #${payload.id} (Yêu cầu: ${topup.amount}đ, Thực nhận: ${receivedAmount}đ)`,
-    });
+  // Trạng thái 'pending' hoặc 'expired': Nạp đúng số tiền thực nhận (Dynamic Real-Amount Credit Policy)
+  const newBalance = lockedWallet.balance + receivedAmount;
 
-    // Step 4: Lock wallet_topups NEXT -> chuyển status thành credited
-    const lockedTopups = await tx
-      .select()
-      .from(walletTopups)
-      .where(eq(walletTopups.id, topup.id))
-      .for("update");
+  await tx
+    .update(wallets)
+    .set({
+      balance: newBalance,
+      updatedAt: new Date(),
+    })
+    .where(eq(wallets.discordUserId, freshTopup.discordUserId));
 
-    const lockedTopup = lockedTopups[0];
-    if (!lockedTopup || lockedTopup.status === "credited") {
-      throw new Error(`Topup #${topup.id} đã được xử lý bởi giao dịch khác`);
-    }
-
-    await tx
-      .update(walletTopups)
-      .set({
-        status: "credited",
-        paidAmount: receivedAmount,
-        creditedAt: new Date(),
-      })
-      .where(eq(walletTopups.id, topup.id));
-
-    // Cập nhật sepay_transactions (orderId: null, topupId: topup.id)
-    await tx
-      .update(sepayTransactions)
-      .set({
-        status: "credited",
-        orderId: null,
-        topupId: topup.id,
-        processedAt: new Date(),
-        description: `Nạp ví thành công số tiền ${receivedAmount}đ`,
-      })
-      .where(eq(sepayTransactions.id, sepayRow.id));
-
-    return {
-      handled: "topup",
-      topupId: topup.id,
-      discordUserId: topup.discordUserId,
-      credited: receivedAmount,
-    };
+  await tx.insert(walletLedger).values({
+    discordUserId: freshTopup.discordUserId,
+    delta: receivedAmount,
+    balanceAfter: newBalance,
+    kind: "topup_credit",
+    refType: "wallet_topups",
+    refId: freshTopup.id,
+    note: `Nạp tiền ví qua SePay #${payload.id} (Yêu cầu: ${freshTopup.amount}đ, Thực nhận: ${receivedAmount}đ)`,
   });
+
+  await tx
+    .update(walletTopups)
+    .set({
+      status: "credited",
+      paidAmount: receivedAmount,
+      creditedAt: new Date(),
+    })
+    .where(eq(walletTopups.id, freshTopup.id));
+
+  await tx
+    .update(sepayTransactions)
+    .set({
+      status: "credited",
+      orderId: null,
+      topupId: freshTopup.id,
+      processedAt: new Date(),
+      description: `Nạp ví thành công số tiền ${receivedAmount}đ`,
+    })
+    .where(eq(sepayTransactions.id, sepayRow.id));
+
+  return {
+    handled: "topup",
+    topupId: freshTopup.id,
+    discordUserId: freshTopup.discordUserId,
+    credited: receivedAmount,
+  };
 }
 
 /**

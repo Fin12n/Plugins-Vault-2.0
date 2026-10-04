@@ -25,7 +25,7 @@
     "tidy-names": "tsx scripts/tidy-plugin-names.ts",
     "typecheck": "tsc --noEmit",
     "docs:web": "node scripts/build-docs-site.mjs",
-    "test": "vitest run",
+    "test": "vitest run --pool=forks --poolOptions.forks.maxForks=3",
     "test:watch": "vitest",
     "dashboard:build": "npm --prefix dashboard run build",
     "spigot-login": "tsx scripts/spigot-login.ts",

@@ -10,7 +10,24 @@ export type SepayStatus =
   | "underpaid"
   | "overpaid"
   | "refunded"
-  | "duplicate_transfer";
+  | "duplicate_transfer"
+  | "ignored_outgoing"
+  | "ignored_no_code";
+
+/**
+ * Kiểm tra xem trạng thái SePay có phải là Terminal (kết thúc, không được retry/resume) hay không.
+ */
+export function isTerminalSepayStatus(status: string): boolean {
+  return [
+    "credited",
+    "overpaid",
+    "underpaid",
+    "duplicate_transfer",
+    "refunded",
+    "ignored_outgoing",
+    "ignored_no_code",
+  ].includes(status);
+}
 
 /**
  * Kiểm tra xem giao dịch SePay đã từng được xử lý chưa (Idempotency Guard).
@@ -28,17 +45,24 @@ export async function hasSepayTransaction(
 }
 
 /**
- * Tìm giao dịch SePay theo sepayId.
+ * Tìm giao dịch SePay theo sepayId (có hỗ trợ khóa hàng FOR UPDATE).
  */
 export async function findSepayTransactionBySepayId(
   db: DbOrTx,
-  sepayId: number
+  sepayId: number,
+  options?: { forUpdate?: boolean }
 ): Promise<SepayTransaction | null> {
-  const rows = await db
+  let query = db
     .select()
     .from(sepayTransactions)
     .where(eq(sepayTransactions.sepayId, sepayId))
     .limit(1);
+
+  if (options?.forUpdate && "for" in query) {
+    query = (query as any).for("update");
+  }
+
+  const rows = await query;
   return rows[0] ?? null;
 }
 

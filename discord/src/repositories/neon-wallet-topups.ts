@@ -34,8 +34,10 @@ export async function createWalletTopup(
   return created;
 }
 
+import type { DbOrTx } from "./neon-wallets.js";
+
 export async function findTopupById(
-  db: Database,
+  db: DbOrTx,
   id: number
 ): Promise<WalletTopup | null> {
   const result = await db
@@ -46,7 +48,7 @@ export async function findTopupById(
 }
 
 export async function findTopupByCode(
-  db: Database,
+  db: DbOrTx,
   code: string
 ): Promise<WalletTopup | null> {
   const result = await db

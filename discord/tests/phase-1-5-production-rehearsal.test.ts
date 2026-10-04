@@ -258,7 +258,7 @@ function createStagingNeonDb(): NeonDb {
 
     insert: (table: any) => ({
       values: (val: any) => {
-        const doInsert = () => {
+        const doInsert = (onConflictDoNothing = false) => {
           const tableName = getTableName(table);
           const id = val.id || nextId++;
           const row = { id, ...val };
@@ -274,6 +274,13 @@ function createStagingNeonDb(): NeonDb {
           } else if (tableName === 'sepay_transactions') {
             if (row.orderId && row.topupId) {
               throw new Error('violates check constraint "chk_sepay_target_exclusivity"');
+            }
+            const conflict = Array.from(sepay.values()).find(
+              (s: any) => s.sepayId === val.sepayId
+            );
+            if (conflict) {
+              if (onConflictDoNothing) return [];
+              throw new Error('duplicate key value violates unique constraint "sepay_transactions_sepay_id_key"');
             }
             sepay.set(id, row);
           } else if (tableName === 'wallet_ledger') {
@@ -318,15 +325,15 @@ function createStagingNeonDb(): NeonDb {
 
         return {
           onConflictDoNothing: () => ({
-            returning: () => doInsert(),
-            then: (resolve: any) => resolve(doInsert()),
+            returning: () => doInsert(true),
+            then: (resolve: any) => resolve(doInsert(true)),
           }),
           onConflictDoUpdate: () => ({
-            returning: () => doInsert(),
-            then: (resolve: any) => resolve(doInsert()),
+            returning: () => doInsert(false),
+            then: (resolve: any) => resolve(doInsert(false)),
           }),
-          returning: () => doInsert(),
-          then: (resolve: any) => resolve(doInsert()),
+          returning: () => doInsert(false),
+          then: (resolve: any) => resolve(doInsert(false)),
         };
       },
     }),

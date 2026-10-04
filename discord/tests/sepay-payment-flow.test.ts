@@ -477,8 +477,8 @@ describe('sepay webhook route', () => {
     mockNeonDb = {
       select: () => ({
         from: () => ({
-          where: (cond: any) => ({
-            limit: () => {
+          where: (cond: any) => {
+            const run = () => {
               let sepayId: number | undefined;
               if (cond?.queryChunks) {
                 for (const chunk of cond.queryChunks) {
@@ -499,24 +499,48 @@ describe('sepay webhook route', () => {
                 return [sepayTxMap.get(sepayId)];
               }
               return [];
-            },
-          }),
+            };
+            return {
+              limit: run,
+              for: run,
+              then: (resolve: any) => resolve(run()),
+            };
+          },
         }),
       }),
       insert: () => ({
         values: (val: any) => {
-          sepayTxMap.set(val.sepayId, val);
-          try {
-            db.prepare(
-              'INSERT OR IGNORE INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, raw_payload, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            ).run(val.sepayId, val.amount, val.transferType, val.code ?? '', val.content ?? '', val.description ?? '', JSON.stringify(val.rawPayload ?? {}), 1000);
-          } catch {}
-          return { returning: () => [{ id: val.sepayId, ...val }] };
+          const doInsert = (doNothing = false) => {
+            if (val.sepayId && sepayTxMap.has(val.sepayId)) {
+              if (doNothing) return [];
+            }
+            const row = { id: val.sepayId, status: 'unmatched', ...val };
+            sepayTxMap.set(val.sepayId, row);
+            try {
+              db.prepare(
+                'INSERT OR IGNORE INTO sepay_transactions (sepay_id, amount, transfer_type, code, content, description, raw_payload, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+              ).run(val.sepayId, val.amount, val.transferType, val.code ?? '', val.content ?? '', val.description ?? '', JSON.stringify(val.rawPayload ?? {}), 1000);
+            } catch {}
+            return [row];
+          };
+          return {
+            onConflictDoNothing: () => ({
+              returning: () => doInsert(true),
+              then: (resolve: any) => resolve(doInsert(true)),
+            }),
+            returning: () => doInsert(false),
+            then: (resolve: any) => resolve(doInsert(false)),
+          };
         },
       }),
       update: () => ({
-        set: () => ({
-          where: () => Promise.resolve(),
+        set: (patch: any) => ({
+          where: (_cond: any) => {
+            for (const [k, v] of sepayTxMap.entries()) {
+              sepayTxMap.set(k, { ...v, ...patch });
+            }
+            return Promise.resolve();
+          },
         }),
       }),
       transaction: async (cb: any) => cb(mockNeonDb),
