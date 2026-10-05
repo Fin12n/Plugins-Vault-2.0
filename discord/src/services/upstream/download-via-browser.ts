@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from 'node:fs';
-import { open, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { DownloadOutcome } from './download-spigot-resource.js';
 import type { Credential } from './spigot-credential-store.js';
 import { downloadUrlFor, findVersionId } from './spigot-version-links.js';
@@ -37,6 +37,7 @@ export type BrowserPage = {
   mouse: { click: (x: number, y: number) => Promise<void>; move: (x: number, y: number) => Promise<void> };
   keyboard: { type: (text: string, options?: object) => Promise<void>; press: (key: string) => Promise<void> };
   authenticate?: (credentials: { username: string; password: string }) => Promise<void>;
+  close?: () => Promise<void>;
 };
 
 export type BrowserSession = {
@@ -72,6 +73,8 @@ export type BrowserDownloadDeps = {
   log?: (message: string) => void;
   solver?: ChallengeSolver;
   challengeTimings?: { pollMs?: number; delay?: (ms: number) => Promise<void>; now?: () => number };
+  onHeartbeat?: () => void;
+  onProgress?: (bytes: number, status?: string) => void;
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -959,84 +962,6 @@ export async function downloadViaBrowser(
 
     log(`  link tải: ${downloadUrl}`);
 
-    // Cách 1: Tải trực tiếp trong phiên Context của Chrome
-    log(`resource ${resourceId}: đang tải qua fetch trong trình duyệt…`);
-    const fetchOutcomeRaw = await (page.evaluate(
-      `(async () => {
-        try {
-          const res = await fetch(${JSON.stringify(downloadUrl)}, {
-            credentials: 'include',
-            redirect: 'follow',
-          });
-          if (!res.ok) {
-            const text = await res.text().catch(() => '').then((t) => t.slice(0, 300));
-            return JSON.stringify({ ok: false, status: res.status, text });
-          }
-          const buf = await res.arrayBuffer();
-          const bytes = new Uint8Array(buf);
-          const CHUNK = 32768;
-          let binary = '';
-          for (let i = 0; i < bytes.length; i += CHUNK) {
-            binary += String.fromCharCode.apply(
-              null,
-              bytes.subarray(i, Math.min(i + CHUNK, bytes.length)),
-            );
-          }
-          return JSON.stringify({ ok: true, data: btoa(binary), size: bytes.length });
-        } catch (e) {
-          return JSON.stringify({ ok: false, error: String(e) });
-        }
-      })()` as never,
-    ) as Promise<string>).catch(() => null);
-
-    if (fetchOutcomeRaw) {
-      type FetchOutcome =
-        | { ok: true; data: string; size: number }
-        | { ok: false; status?: number; text?: string; error?: string };
-      let fetchOutcome: FetchOutcome | null = null;
-      try { fetchOutcome = JSON.parse(fetchOutcomeRaw) as FetchOutcome; } catch { }
-
-      if (fetchOutcome?.ok) {
-        const { data, size } = fetchOutcome as { ok: true; data: string; size: number };
-        if (size < MIN_PLAUSIBLE_BYTES) {
-          log(`resource ${resourceId}: fetch trả về file quá nhỏ (${size} byte) — bỏ qua, thử lại qua CDP`);
-        } else if (size > deps.maxBytes) {
-          return { status: 'error', detail: `tệp ${size} byte vượt giới hạn ${deps.maxBytes}` };
-        } else {
-          const fileBuffer = Buffer.from(data, 'base64');
-          if (fileBuffer.subarray(0, 2).toString() !== 'PK') {
-            const text = fileBuffer.subarray(0, 200).toString('utf8');
-            if (/must be logged in|log in to/i.test(text)) {
-              log(`resource ${resourceId}: fetch trả về trang đăng nhập — phiên hết hạn`);
-              return { status: 'cookie_dead' };
-            }
-            if (/do not have permission|not have access|must purchase|buy this/i.test(text)) {
-              log(`resource ${resourceId}: fetch trả về trang lỗi quyền truy cập`);
-              return { status: 'not_owned' };
-            }
-            if (/just a moment|checking your browser/i.test(text)) {
-              log(`resource ${resourceId}: fetch bị chặn bởi Cloudflare`);
-              return { status: 'challenged', detail: 'Cloudflare chặn khi tải qua fetch' };
-            }
-            log(`resource ${resourceId}: fetch trả về nội dung không phải jar (${size} byte) — thử CDP`);
-          } else {
-            const finalPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar`);
-            await writeFile(finalPath, fileBuffer);
-            log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB (qua fetch)`);
-            return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
-          }
-        }
-      } else if (fetchOutcome && !fetchOutcome.ok) {
-        const fo = fetchOutcome as { ok: false; status?: number; text?: string; error?: string };
-        log(`resource ${resourceId}: fetch thất bại (${fo.error ?? `HTTP ${fo.status ?? '?'}`}) — thử CDP`);
-        const errText = (fo.text ?? fo.error ?? '').toLowerCase();
-        if (/must be logged in|log in to/.test(errText)) return { status: 'cookie_dead' };
-        if (/do not have permission|not have access|must purchase|buy this/.test(errText)) return { status: 'not_owned' };
-      }
-    }
-
-    // Cách 2: Tải dự phòng bằng CDP + goto
-    log(`resource ${resourceId}: thử tải qua CDP + goto (dự phòng)…`);
     const cdp = await page.createCDPSession();
     try {
       let cdpDownloadOk = false;
@@ -1055,6 +980,115 @@ export async function downloadViaBrowser(
       if (!cdpDownloadOk) {
         log(`resource ${resourceId}: CẢNH BÁO — không set được download path qua CDP`);
       }
+
+      // Cách 1: Tải trực tiếp trong phiên Context của Chrome (Ưu tiên Blob Direct Stream, fallback Base64)
+      log(`resource ${resourceId}: đang tải qua fetch trong trình duyệt…`);
+      const fetchOutcomeRaw = await (page.evaluate(
+        `(async () => {
+          try {
+            const res = await fetch(${JSON.stringify(downloadUrl)}, {
+              credentials: 'include',
+              redirect: 'follow',
+            });
+            if (!res.ok) {
+              const text = await res.text().catch(() => '').then((t) => t.slice(0, 300));
+              return JSON.stringify({ ok: false, status: res.status, text });
+            }
+            const blob = await res.blob();
+            if (blob.size >= 1024) {
+              try {
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl;
+                a.download = 'download.jar';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => {
+                  try { document.body.removeChild(a); } catch { }
+                  URL.revokeObjectURL(blobUrl);
+                }, 10000);
+                return JSON.stringify({ ok: true, directStream: true, size: blob.size });
+              } catch { }
+            }
+
+            // Fallback sang Base64 nếu không trigger được Direct Blob Download
+            const buf = await blob.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            const CHUNK = 32768;
+            let binary = '';
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+              binary += String.fromCharCode.apply(
+                null,
+                bytes.subarray(i, Math.min(i + CHUNK, bytes.length)),
+              );
+            }
+            return JSON.stringify({ ok: true, data: btoa(binary), size: bytes.length });
+          } catch (e) {
+            return JSON.stringify({ ok: false, error: String(e) });
+          }
+        })()` as never,
+      ) as Promise<string>).catch(() => null);
+
+      if (fetchOutcomeRaw) {
+        type FetchOutcome =
+          | { ok: true; directStream?: boolean; data?: string; size: number }
+          | { ok: false; status?: number; text?: string; error?: string };
+        let fetchOutcome: FetchOutcome | null = null;
+        try { fetchOutcome = JSON.parse(fetchOutcomeRaw) as FetchOutcome; } catch { }
+
+        if (fetchOutcome?.ok) {
+          const { directStream, data, size } = fetchOutcome;
+          if (size < MIN_PLAUSIBLE_BYTES) {
+            log(`resource ${resourceId}: fetch trả về file quá nhỏ (${size} byte) — bỏ qua, thử lại qua CDP`);
+          } else if (size > deps.maxBytes) {
+            return { status: 'error', detail: `tệp ${size} byte vượt giới hạn ${deps.maxBytes}` };
+          } else if (directStream) {
+            log(`resource ${resourceId}: đã kích hoạt direct stream nhị phân (${(size / 1048576).toFixed(2)} MB), đang chờ tệp ghi đĩa…`);
+            // Chờ một khoảng ngắn cho tệp rơi vào dir
+            await sleep(500);
+          } else if (data) {
+            const fileBuffer = Buffer.from(data, 'base64');
+            if (fileBuffer.subarray(0, 2).toString() !== 'PK') {
+              const text = fileBuffer.subarray(0, 200).toString('utf8');
+              if (/must be logged in|log in to/i.test(text)) {
+                log(`resource ${resourceId}: fetch trả về trang đăng nhập — phiên hết hạn`);
+                return { status: 'cookie_dead' };
+              }
+              if (/do not have permission|not have access|must purchase|buy this/i.test(text)) {
+                log(`resource ${resourceId}: fetch trả về trang lỗi quyền truy cập`);
+                return { status: 'not_owned' };
+              }
+              if (/just a moment|checking your browser/i.test(text)) {
+                log(`resource ${resourceId}: fetch bị chặn bởi Cloudflare`);
+                return { status: 'challenged', detail: 'Cloudflare chặn khi tải qua fetch' };
+              }
+              log(`resource ${resourceId}: fetch trả về nội dung không phải jar (${size} byte) — thử CDP`);
+            } else {
+              const partPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar.part`);
+              const finalPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar`);
+              try {
+                await writeFile(partPath, fileBuffer);
+                const sha256 = createHash('sha256').update(fileBuffer).digest('hex');
+                await rename(partPath, finalPath);
+                log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB (SHA256: ${sha256.slice(0, 12)}… qua fetch fallback)`);
+                return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
+              } catch (writeErr) {
+                await unlink(partPath).catch(() => undefined);
+                throw writeErr;
+              }
+            }
+          }
+        } else if (fetchOutcome && !fetchOutcome.ok) {
+          const fo = fetchOutcome as { ok: false; status?: number; text?: string; error?: string };
+          log(`resource ${resourceId}: fetch thất bại (${fo.error ?? `HTTP ${fo.status ?? '?'}`}) — thử CDP`);
+          const errText = (fo.text ?? fo.error ?? '').toLowerCase();
+          if (/must be logged in|log in to/.test(errText)) return { status: 'cookie_dead' };
+          if (/do not have permission|not have access|must purchase|buy this/.test(errText)) return { status: 'not_owned' };
+        }
+      }
+
+      // Cách 2: Tải dự phòng bằng CDP + goto
+      log(`resource ${resourceId}: thử tải qua CDP + goto (dự phòng)…`);
 
       const openDownload = (): Promise<unknown> =>
         page.goto(downloadUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
@@ -1111,6 +1145,7 @@ export async function downloadViaBrowser(
 
       while (Date.now() < deadline) {
         if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
+        deps.onHeartbeat?.();
         await sleep(2_000);
 
         try {
@@ -1136,6 +1171,8 @@ export async function downloadViaBrowser(
 
         if (partial.length > 0 || bytes > 0) {
           downloadStarted = true;
+          deps.onHeartbeat?.();
+          deps.onProgress?.(bytes, 'downloading');
         }
 
         if (Date.now() - lastReport > 10_000) {
@@ -1177,10 +1214,23 @@ export async function downloadViaBrowser(
           return { status: 'incomplete', detail: `tải về không phải jar (${size} byte)` };
         }
 
+        const partPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar.part`);
         const finalPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar`);
-        await rename(path, finalPath);
-        log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB — ${files[0]}`);
-        return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
+        try {
+          await rename(path, partPath);
+          const fileBytes = await readFile(partPath);
+          if (fileBytes.length !== size) {
+            await unlink(partPath).catch(() => undefined);
+            return { status: 'incomplete', detail: `kích thước tệp không khớp (${fileBytes.length} != ${size})` };
+          }
+          const sha256 = createHash('sha256').update(fileBytes).digest('hex');
+          await rename(partPath, finalPath);
+          log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB (SHA256: ${sha256.slice(0, 12)}…) — ${files[0]}`);
+          return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
+        } catch (renameErr) {
+          await unlink(partPath).catch(() => undefined);
+          throw renameErr;
+        }
       }
 
       const message = await readPageMessage(page);

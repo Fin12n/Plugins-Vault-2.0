@@ -62,6 +62,7 @@ import {
   pruneOrphanProfiles,
   type LauncherProbe,
 } from '../upstream/browser-launcher.js';
+import { HierarchicalDeadline } from '../upstream/hierarchical-deadline.js';
 import { cloakSessionManager } from '../upstream/cloak-session-manager.js';
 import {
   extractAndSaveCookiesFromPage,
@@ -2682,29 +2683,47 @@ async function runBrowserSweep(
             });
             sweepLogs.addForWorker(workerId, `Đang tải ${pluginName} v${versionName}...`, 'info');
 
+            const jobDeadline = new HierarchicalDeadline({
+              jobTimeoutMs: 180_000,
+              parentSignal: deps.signal,
+            });
+            const downloadDeadline = jobDeadline.createChildSignal(120_000);
+
             const workerTab = session.page;
-            outcome = await downloadViaBrowser(
-              {
-                tmpDir: deps.env.TMP_DIR,
-                maxBytes: deps.env.UPLOAD_MAX_FILE_BYTES,
-                ...(activeProxyId === null ? { fetchImpl: fetch } : {}),
-                ...(activeSolver ? { solver: activeSolver } : {}),
-                log: (message) => {
-                  const msg = message.trim();
-                  const isErr =
-                    msg.includes('lỗi') ||
-                    msg.includes('thất bại') ||
-                    msg.includes('Error') ||
-                    msg.includes('hết thời gian');
-                  const isOk = msg.includes('thành công') || msg.includes('xong') || msg.includes('OK');
-                  instanceTracker.heartbeat(workerId, msg);
-                  sweepLogs.addForWorker(workerId, msg, isErr ? 'error' : isOk ? 'success' : 'info');
+            try {
+              outcome = await downloadViaBrowser(
+                {
+                  tmpDir: deps.env.TMP_DIR,
+                  maxBytes: deps.env.UPLOAD_MAX_FILE_BYTES,
+                  signal: downloadDeadline.signal,
+                  ...(activeProxyId === null ? { fetchImpl: fetch } : {}),
+                  ...(activeSolver ? { solver: activeSolver } : {}),
+                  onHeartbeat: () => {
+                    instanceTracker.heartbeat(workerId);
+                  },
+                  onProgress: (bytes, status) => {
+                    const mb = (bytes / 1048576).toFixed(1);
+                    instanceTracker.heartbeat(workerId, `Đang tải: ${mb} MB (${status ?? 'in_progress'})`);
+                  },
+                  log: (message) => {
+                    const msg = message.trim();
+                    const isErr =
+                      msg.includes('lỗi') ||
+                      msg.includes('thất bại') ||
+                      msg.includes('Error') ||
+                      msg.includes('hết thời gian');
+                    const isOk = msg.includes('thành công') || msg.includes('xong') || msg.includes('OK');
+                    instanceTracker.heartbeat(workerId, msg);
+                    sweepLogs.addForWorker(workerId, msg, isErr ? 'error' : isOk ? 'success' : 'info');
+                  },
                 },
-              },
-              workerTab,
-              resourceId,
-              versionName,
-            );
+                workerTab,
+                resourceId,
+                versionName,
+              );
+            } finally {
+              downloadDeadline.cleanup();
+            }
 
             // Cập nhật thống kê worker
             const currentWorker = instanceTracker.getAll().find((w) => w.id === workerId);

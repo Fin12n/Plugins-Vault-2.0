@@ -1,9 +1,10 @@
 import { existsSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Lỗi phát sinh khi có yêu cầu mở session CloakBrowser mới trong khi
- * đã có một session khác đang hoạt động.
+ * đã có một session khác đang hoạt động và không thể xếp hàng.
  */
 export class SessionConflictError extends Error {
   constructor(public readonly currentTask: string, public readonly requestedTask: string) {
@@ -35,18 +36,43 @@ export type SessionLockHandle = {
   markDead: () => void;
 };
 
+export type AcquireOptions = {
+  tempProfileDir?: string;
+  waitTimeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+type QueueWaiter = {
+  id: string;
+  taskName: string;
+  tempProfileDir?: string;
+  resolve: (handle: SessionLockHandle) => void;
+  reject: (err: Error) => void;
+  timeoutTimer: NodeJS.Timeout | null;
+  onAbort?: () => void;
+  signal?: AbortSignal;
+};
+
 /**
  * Singleton CloakSessionManager: Quản lý độc quyền phiên CloakBrowser trên toàn hệ thống.
  * Đảm bảo CHỈ CÓ DUY NHẤT 1 BROWSER SESSION được phép hoạt động tại bất kỳ thời điểm nào.
  */
 class CloakSessionManager {
   private activeSession: ActiveSessionInfo | null = null;
+  private waitQueue: QueueWaiter[] = [];
 
   /**
    * Kiểm tra xem hiện có session CloakBrowser nào đang hoạt động hay không.
    */
   public hasActiveSession(): boolean {
     return this.activeSession !== null;
+  }
+
+  /**
+   * Số lượng tác vụ đang chờ trong hàng đợi.
+   */
+  public getQueueLength(): number {
+    return this.waitQueue.length;
   }
 
   /**
@@ -101,57 +127,10 @@ class CloakSessionManager {
   }
 
   /**
-   * Quét và dọn dẹp các tiến trình Chromium/CloakBrowser mồ côi (orphan/zombie processes)
-   * chạy ngầm gây chiếm dụng session slot hoặc khóa profile.
+   * Tạo handle quản lý khóa phiên cho tác vụ.
    */
-  public forceCleanupOrphanProcesses(): void {
-    if (process.platform === 'win32') {
-      try {
-        // Trên Windows: nếu không có session nào được quản lý mà vẫn còn chrome.exe rác
-        // ta có thể dọn sạch các chrome process không mong muốn nếu cần thiết.
-        // Chỉ chạy khi không có active session để tránh kill nhầm.
-        if (!this.activeSession) {
-          // Bỏ qua hoặc chỉ log để an toàn
-        }
-      } catch {
-        // Bỏ qua lỗi nếu không có process nào
-      }
-    } else if (process.platform === 'linux') {
-      try {
-        // Trên Linux: dọn dẹp nếu có lệnh
-      } catch {
-        // Bỏ qua lỗi
-      }
-    }
-  }
-
-  /**
-   * Yêu cầu cấp phát khóa độc quyền (Mutex Lock) để mở session CloakBrowser mới.
-   * Nếu đã có session đang chạy:
-   *  - Nếu session cũ đã chết (crashed/disconnected), tự động dọn dẹp và cấp lock mới.
-   *  - Nếu session cũ còn sống, ném lỗi SessionConflictError ngay lập tức.
-   */
-  public async acquireLock(taskName: string, tempProfileDir?: string): Promise<SessionLockHandle> {
-    if (this.activeSession !== null) {
-      if (this.isSessionDead(this.activeSession)) {
-        console.warn(
-          `[CloakSessionManager] Phát hiện phiên CloakBrowser cũ cho tác vụ "${this.activeSession.taskName}" đã chết (crashed/disconnected). Tự động dọn dẹp để cấp lock mới cho "${taskName}".`
-        );
-        await this.releaseLock();
-      } else {
-        throw new SessionConflictError(this.activeSession.taskName, taskName);
-      }
-    }
-
-    const sessionInfo: ActiveSessionInfo = {
-      taskName,
-      startedAt: Date.now(),
-      browser: null,
-      tempProfileDir,
-    };
-
-    this.activeSession = sessionInfo;
-
+  private createLockHandle(sessionInfo: ActiveSessionInfo): SessionLockHandle {
+    const taskName = sessionInfo.taskName;
     return {
       taskName,
       startedAt: sessionInfo.startedAt,
@@ -197,7 +176,93 @@ class CloakSessionManager {
   }
 
   /**
-   * Đóng sạch sẽ session hiện tại, giải phóng tài nguyên và xóa profile tạm nếu có.
+   * Yêu cầu cấp phát khóa độc quyền (Mutex Lock) để mở session CloakBrowser mới.
+   * Nếu đã có session đang chạy:
+   *  - Nếu session cũ đã chết, tự động dọn dẹp và cấp lock mới.
+   *  - Nếu session cũ còn sống và có waitTimeoutMs > 0, xếp hàng vào FIFO queue.
+   *  - Nếu waitTimeoutMs === 0, ném SessionConflictError ngay lập tức (fail-fast).
+   */
+  public async acquireLock(
+    taskName: string,
+    optionsOrTempDir?: string | AcquireOptions,
+  ): Promise<SessionLockHandle> {
+    const options: AcquireOptions =
+      typeof optionsOrTempDir === 'string'
+        ? { tempProfileDir: optionsOrTempDir }
+        : (optionsOrTempDir ?? {});
+
+    if (options.signal?.aborted) {
+      throw new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho "${taskName}" đã bị hủy trước khi bắt đầu`);
+    }
+
+    if (this.activeSession !== null) {
+      if (this.isSessionDead(this.activeSession)) {
+        console.warn(
+          `[CloakSessionManager] Phát hiện phiên CloakBrowser cũ cho tác vụ "${this.activeSession.taskName}" đã chết (crashed/disconnected). Tự động dọn dẹp để cấp lock mới cho "${taskName}".`
+        );
+        await this.releaseLock();
+      } else if (options.waitTimeoutMs === 0) {
+        throw new SessionConflictError(this.activeSession.taskName, taskName);
+      } else {
+        // Đưa vào hàng đợi FIFO chờ phục vụ
+        return new Promise<SessionLockHandle>((resolve, reject) => {
+          const waiterId = randomUUID();
+          const timeoutMs = options.waitTimeoutMs ?? 60_000;
+          let timeoutTimer: NodeJS.Timeout | null = null;
+
+          const removeWaiter = () => {
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            const idx = this.waitQueue.findIndex((w) => w.id === waiterId);
+            if (idx !== -1) this.waitQueue.splice(idx, 1);
+            if (options.signal && onAbort) {
+              options.signal.removeEventListener('abort', onAbort);
+            }
+          };
+
+          if (timeoutMs > 0 && timeoutMs !== Infinity) {
+            timeoutTimer = setTimeout(() => {
+              removeWaiter();
+              reject(new Error(`[CloakSessionManager] Hết thời gian chờ cấp khóa (${timeoutMs}ms) cho tác vụ "${taskName}"`));
+            }, timeoutMs);
+            timeoutTimer.unref();
+          }
+
+          let onAbort: (() => void) | undefined;
+          if (options.signal) {
+            onAbort = () => {
+              removeWaiter();
+              reject(new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho tác vụ "${taskName}" đã bị hủy bởi caller`));
+            };
+            options.signal.addEventListener('abort', onAbort, { once: true });
+          }
+
+          this.waitQueue.push({
+            id: waiterId,
+            taskName,
+            tempProfileDir: options.tempProfileDir,
+            resolve,
+            reject,
+            timeoutTimer,
+            onAbort,
+            signal: options.signal,
+          });
+        });
+      }
+    }
+
+    const sessionInfo: ActiveSessionInfo = {
+      taskName,
+      startedAt: Date.now(),
+      browser: null,
+      tempProfileDir: options.tempProfileDir,
+    };
+
+    this.activeSession = sessionInfo;
+    return this.createLockHandle(sessionInfo);
+  }
+
+  /**
+   * Đóng sạch sẽ session hiện tại, giải phóng tài nguyên và chuyển giao lock cho tác vụ tiếp theo trong queue (FIFO).
    */
   public async releaseLock(taskName?: string): Promise<void> {
     if (!this.activeSession) return;
@@ -260,12 +325,53 @@ class CloakSessionManager {
         );
       }
     }
+
+    // 3. Phục vụ tác vụ tiếp theo trong hàng đợi FIFO (nếu có)
+    while (this.waitQueue.length > 0) {
+      const nextWaiter = this.waitQueue.shift()!;
+      if (nextWaiter.timeoutTimer) clearTimeout(nextWaiter.timeoutTimer);
+      if (nextWaiter.signal && nextWaiter.onAbort) {
+        nextWaiter.signal.removeEventListener('abort', nextWaiter.onAbort);
+      }
+
+      // Nếu waiter đã bị aborted giữa lúc chờ, bỏ qua
+      if (nextWaiter.signal?.aborted) {
+        continue;
+      }
+
+      const nextSession: ActiveSessionInfo = {
+        taskName: nextWaiter.taskName,
+        startedAt: Date.now(),
+        browser: null,
+        tempProfileDir: nextWaiter.tempProfileDir,
+      };
+
+      this.activeSession = nextSession;
+      nextWaiter.resolve(this.createLockHandle(nextSession));
+      break;
+    }
   }
 
   /**
-   * Reset hoàn toàn trạng thái lock (dùng trong test hoặc phục hồi khẩn cấp).
+   * Giải tán toàn bộ hàng đợi (thường dùng khi shutdown).
+   */
+  public drainQueue(reason = 'System shutdown'): void {
+    const waiters = [...this.waitQueue];
+    this.waitQueue = [];
+    for (const w of waiters) {
+      if (w.timeoutTimer) clearTimeout(w.timeoutTimer);
+      if (w.signal && w.onAbort) {
+        w.signal.removeEventListener('abort', w.onAbort);
+      }
+      w.reject(new Error(`[CloakSessionManager] Hàng đợi bị giải tán (${reason}) cho tác vụ "${w.taskName}"`));
+    }
+  }
+
+  /**
+   * Reset hoàn toàn trạng thái lock và queue (dùng trong test hoặc phục hồi khẩn cấp).
    */
   public reset(): void {
+    this.drainQueue('Reset manager');
     this.activeSession = null;
   }
 }

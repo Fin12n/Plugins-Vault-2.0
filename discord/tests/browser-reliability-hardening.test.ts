@@ -1,8 +1,9 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { createAbruptCloseTracker, isChromeClosedError } from '../src/services/upstream/chrome-close-detector.js';
 import { cloakSessionManager, SessionConflictError } from '../src/services/upstream/cloak-session-manager.js';
 import {
@@ -12,6 +13,13 @@ import {
   type BrowserSession,
 } from '../src/services/upstream/download-via-browser.js';
 import { applyClearance } from '../src/services/upstream/cloudflare-clearance.js';
+import {
+  warmBrowserManager,
+  shutdownWarmBrowser,
+  resolveChromePath,
+  invalidateChromePathCache,
+} from '../src/services/upstream/browser-launcher.js';
+import { HierarchicalDeadline } from '../src/services/upstream/hierarchical-deadline.js';
 import { InstanceTracker } from '../src/services/maintenance/instance-tracker.js';
 
 describe('Phase 4A — Browser Reliability Hardening', () => {
@@ -516,5 +524,610 @@ describe('Phase 4A — Browser Reliability Hardening', () => {
     if (existsSync(tempDir)) {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  // =========================================================================
+  // Phase 4B-1: DIRECT DOWNLOAD PIPELINE & ARTIFACT INTEGRITY
+  // =========================================================================
+  describe('Phase 4B-1 — Direct Download Pipeline & Integrity', () => {
+    it('TEST-P01: download pipeline verifies SHA256 and atomically publishes jar without leaking .part', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'dl-atomic-publish-'));
+      const testJarContent = Buffer.concat([
+        Buffer.from('PK\x03\x04'),
+        Buffer.alloc(1024 * 1024, 0x42), // 1MB payload
+      ]);
+      const expectedSha256 = createHash('sha256').update(testJarContent).digest('hex');
+
+      let downloadDir = '';
+      const mockPage: BrowserPage = {
+        goto: vi.fn().mockImplementation(async (url: string) => {
+          if (url.includes('download') && downloadDir) {
+            writeFileSync(join(downloadDir, 'TestPlugin.jar'), testJarContent);
+          }
+          return undefined;
+        }),
+        evaluate: vi.fn().mockImplementation(async (source: unknown) => {
+          const src = String(source);
+          if (src.includes('a[href*="download"]')) return 'https://www.spigotmc.org/resources/83626/download?version=12345';
+          return null;
+        }),
+        title: vi.fn().mockResolvedValue('Download Resource'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+            if (method === 'Browser.setDownloadBehavior' || method === 'Page.setDownloadBehavior') {
+              downloadDir = String(params?.downloadPath ?? '');
+            }
+            return undefined;
+          }),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+      };
+
+      try {
+        const outcome = await downloadViaBrowser(
+          {
+            tmpDir: tempDir,
+            maxBytes: 10_000_000,
+            log: () => undefined,
+          },
+          mockPage,
+          83626,
+          null,
+        );
+
+        expect(outcome.status).toBe('ok');
+        if (outcome.status === 'ok') {
+          expect(existsSync(outcome.tmpPath)).toBe(true);
+          expect(outcome.bytes).toBe(testJarContent.length);
+          const publishedContent = readFileSync(outcome.tmpPath);
+          const publishedSha256 = createHash('sha256').update(publishedContent).digest('hex');
+          expect(publishedSha256).toBe(expectedSha256);
+
+          // Verify NO partial artifact (.part) exists in tmpDir
+          const remainingFiles = readdirSync(tempDir);
+          expect(remainingFiles.some((f) => f.endsWith('.part'))).toBe(false);
+        }
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('TEST-P02: file size exceeding maxBytes is rejected and temp files cleaned immediately', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'dl-oversize-'));
+      const oversizedContent = Buffer.concat([
+        Buffer.from('PK\x03\x04'),
+        Buffer.alloc(2 * 1024 * 1024, 0x5a), // 2MB
+      ]);
+
+      let downloadDir = '';
+      const mockPage: BrowserPage = {
+        goto: vi.fn().mockImplementation(async (url: string) => {
+          if (url.includes('download') && downloadDir) {
+            writeFileSync(join(downloadDir, 'BigPlugin.jar'), oversizedContent);
+          }
+          return undefined;
+        }),
+        evaluate: vi.fn().mockResolvedValue(null),
+        title: vi.fn().mockResolvedValue('Download Resource'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+            if (method === 'Browser.setDownloadBehavior' || method === 'Page.setDownloadBehavior') {
+              downloadDir = String(params?.downloadPath ?? '');
+            }
+            return undefined;
+          }),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+      };
+
+      try {
+        const outcome = await downloadViaBrowser(
+          {
+            tmpDir: tempDir,
+            maxBytes: 1024 * 1024, // 1MB limit < 2MB content
+            log: () => undefined,
+          },
+          mockPage,
+          83626,
+          null,
+        );
+
+        expect(outcome.status).toBe('error');
+        expect(outcome.detail).toContain('vượt giới hạn');
+
+        // Verify no artifact was published to tmpDir
+        const remainingFiles = readdirSync(tempDir);
+        expect(remainingFiles.filter((f) => f.endsWith('.jar'))).toHaveLength(0);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('TEST-P03: corrupted or non-jar HTML payload is rejected as incomplete without publishing', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'dl-html-corrupt-'));
+      const htmlErrorContent = Buffer.concat([
+        Buffer.from('<!DOCTYPE html><html><body>Error 403 Forbidden - Not a Jar File</body></html>'),
+        Buffer.alloc(2048, 0x20),
+      ]);
+
+      let downloadDir = '';
+      const mockPage: BrowserPage = {
+        goto: vi.fn().mockImplementation(async (url: string) => {
+          if (url.includes('download') && downloadDir) {
+            writeFileSync(join(downloadDir, 'Error.html'), htmlErrorContent);
+          }
+          return undefined;
+        }),
+        evaluate: vi.fn().mockResolvedValue(null),
+        title: vi.fn().mockResolvedValue('Download Resource'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+            if (method === 'Browser.setDownloadBehavior' || method === 'Page.setDownloadBehavior') {
+              downloadDir = String(params?.downloadPath ?? '');
+            }
+            return undefined;
+          }),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+      };
+
+      try {
+        const outcome = await downloadViaBrowser(
+          {
+            tmpDir: tempDir,
+            maxBytes: 10_000_000,
+            log: () => undefined,
+          },
+          mockPage,
+          83626,
+          null,
+        );
+
+        expect(outcome.status).toBe('incomplete');
+        expect(outcome.detail).toContain('không phải jar');
+
+        // Zero published jars
+        const remainingFiles = readdirSync(tempDir);
+        expect(remainingFiles.filter((f) => f.endsWith('.jar'))).toHaveLength(0);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('TEST-P04: signal cancellation cleans up all temporary download files', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'dl-cancel-clean-'));
+      const mockPage: BrowserPage = {
+        goto: vi.fn().mockResolvedValue(undefined),
+        evaluate: vi.fn().mockResolvedValue(null),
+        title: vi.fn().mockResolvedValue('Download Resource'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockResolvedValue(undefined),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+      };
+
+      try {
+        const outcome = await downloadViaBrowser(
+          {
+            tmpDir: tempDir,
+            maxBytes: 10_000_000,
+            signal: AbortSignal.timeout(50),
+            log: () => undefined,
+          },
+          mockPage,
+          83626,
+          null,
+        );
+
+        expect(outcome.status).toBe('error');
+        expect(outcome.detail).toContain('đang tắt tiến trình');
+
+        // Zero partial files left
+        const remainingFiles = readdirSync(tempDir);
+        expect(remainingFiles).toHaveLength(0);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // =========================================================================
+  // Phase 4B-2: CLOAK SESSION FIFO WAIT QUEUE
+  // =========================================================================
+  describe('Phase 4B-2 — Cloak Session FIFO Wait Queue', () => {
+    it('TEST-Q01: 2 concurrent jobs serialize smoothly via FIFO queue without SessionConflictError', async () => {
+      const lock1 = await cloakSessionManager.acquireLock('job-1');
+      expect(lock1.taskName).toBe('job-1');
+      expect(cloakSessionManager.hasActiveSession()).toBe(true);
+
+      let job2Acquired = false;
+      const job2Promise = cloakSessionManager.acquireLock('job-2').then((handle) => {
+        job2Acquired = true;
+        return handle;
+      });
+
+      // Job 2 is queued, not rejected
+      expect(job2Acquired).toBe(false);
+      expect(cloakSessionManager.getQueueLength()).toBe(1);
+
+      // Release Job 1 -> Job 2 receives lock immediately
+      await lock1.release();
+      const lock2 = await job2Promise;
+
+      expect(job2Acquired).toBe(true);
+      expect(lock2.taskName).toBe('job-2');
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+
+      await lock2.release();
+      expect(cloakSessionManager.hasActiveSession()).toBe(false);
+    });
+
+    it('TEST-Q02: 8 concurrent jobs are dispatched strictly in FIFO order', async () => {
+      const lock0 = await cloakSessionManager.acquireLock('job-0');
+      const executionOrder: string[] = ['job-0'];
+
+      const pendingJobs: Promise<void>[] = [];
+      for (let i = 1; i <= 7; i++) {
+        const jobName = `job-${i}`;
+        const p = cloakSessionManager.acquireLock(jobName).then(async (handle) => {
+          executionOrder.push(handle.taskName);
+          await handle.release();
+        });
+        pendingJobs.push(p);
+      }
+
+      expect(cloakSessionManager.getQueueLength()).toBe(7);
+
+      // Release first job to trigger cascading FIFO queue execution
+      await lock0.release();
+      await Promise.all(pendingJobs);
+
+      expect(executionOrder).toEqual([
+        'job-0',
+        'job-1',
+        'job-2',
+        'job-3',
+        'job-4',
+        'job-5',
+        'job-6',
+        'job-7',
+      ]);
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+      expect(cloakSessionManager.hasActiveSession()).toBe(false);
+    });
+
+    it('TEST-Q03: waiting timeout rejects waiter cleanly and clears stale entry from queue', async () => {
+      const lock1 = await cloakSessionManager.acquireLock('job-blocking');
+
+      // Request lock with short 50ms wait timeout
+      const jobTimeoutPromise = cloakSessionManager.acquireLock('job-timed-out', { waitTimeoutMs: 50 });
+
+      expect(cloakSessionManager.getQueueLength()).toBe(1);
+
+      await expect(jobTimeoutPromise).rejects.toThrow('Hết thời gian chờ cấp khóa (50ms)');
+
+      // Queue is clean
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+
+      await lock1.release();
+      expect(cloakSessionManager.hasActiveSession()).toBe(false);
+    });
+
+    it('TEST-Q04: caller cancellation via AbortSignal removes waiter immediately', async () => {
+      const lock1 = await cloakSessionManager.acquireLock('job-active');
+
+      const controller = new AbortController();
+      const jobCancelPromise = cloakSessionManager.acquireLock('job-cancelled', {
+        signal: controller.signal,
+      });
+
+      expect(cloakSessionManager.getQueueLength()).toBe(1);
+
+      // Cancel before lock is granted
+      controller.abort();
+
+      await expect(jobCancelPromise).rejects.toThrow('đã bị hủy bởi caller');
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+
+      await lock1.release();
+    });
+
+    it('TEST-Q05: shutdown drains all pending queue waiters safely without unhandled promises', async () => {
+      const lock1 = await cloakSessionManager.acquireLock('job-running');
+
+      const p1 = cloakSessionManager.acquireLock('job-drain-1');
+      const p2 = cloakSessionManager.acquireLock('job-drain-2');
+
+      expect(cloakSessionManager.getQueueLength()).toBe(2);
+
+      // System shutdown triggers drainQueue
+      cloakSessionManager.drainQueue('Graceful bot shutdown');
+
+      await expect(p1).rejects.toThrow('Hàng đợi bị giải tán (Graceful bot shutdown)');
+      await expect(p2).rejects.toThrow('Hàng đợi bị giải tán (Graceful bot shutdown)');
+
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+      await lock1.release();
+    });
+
+    it('TEST-Q06: crashed browser releases session and allows next queued job to acquire lock', async () => {
+      let isAlive = true;
+      const lock1 = await cloakSessionManager.acquireLock('job-crashing');
+      const mockProc = new EventEmitter();
+      const mockBrowser = {
+        close: vi.fn().mockResolvedValue(undefined),
+        process: () => mockProc,
+        isConnected: () => isAlive,
+      };
+      lock1.registerBrowser(mockBrowser);
+
+      // Queue next job while job1 is still alive
+      const nextJobPromise = cloakSessionManager.acquireLock('job-after-crash');
+      expect(cloakSessionManager.getQueueLength()).toBe(1);
+
+      // Browser crashes and disconnects
+      isAlive = false;
+      lock1.markDead();
+      mockProc.emit('exit', 1, null);
+
+      // Release crashed lock -> Next job in queue immediately acquires
+      await lock1.release();
+      const nextLock = await nextJobPromise;
+
+      expect(nextLock.taskName).toBe('job-after-crash');
+      expect(cloakSessionManager.getQueueLength()).toBe(0);
+
+      await nextLock.release();
+    });
+  });
+
+  // =========================================================================
+  // Phase 4B-3: WARM BROWSER EXPERIMENT
+  // =========================================================================
+  describe('Phase 4B-3 — Warm Browser Experiment', () => {
+    beforeEach(() => {
+      process.env.WARM_BROWSER_EXPERIMENT = 'true';
+      warmBrowserManager.reset();
+    });
+
+    afterEach(async () => {
+      delete process.env.WARM_BROWSER_EXPERIMENT;
+      await shutdownWarmBrowser().catch(() => undefined);
+      warmBrowserManager.reset();
+    });
+
+    it('TEST-W01: Account A -> warm session -> cleanup -> Account B -> verify complete state sanitization', async () => {
+      const cdpCalls: { method: string; params?: any }[] = [];
+      const mockPage = {
+        goto: vi.fn().mockResolvedValue(undefined),
+        evaluate: vi.fn().mockResolvedValue(undefined),
+        title: vi.fn().mockResolvedValue('SpigotMC'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockImplementation(async (method, params) => {
+            cdpCalls.push({ method, params });
+            return {};
+          }),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+
+      // Sanitize before use
+      await warmBrowserManager.sanitizePage(mockPage as any);
+      expect(cdpCalls.some((c) => c.method === 'Network.clearBrowserCookies')).toBe(true);
+      expect(cdpCalls.some((c) => c.method === 'Network.clearBrowserCache')).toBe(true);
+      expect(cdpCalls.some((c) => c.method === 'Storage.clearDataForOrigin' && c.params?.storageTypes === 'all')).toBe(true);
+
+      // Sanitize on release
+      cdpCalls.length = 0;
+      await warmBrowserManager.releaseSessionPage(mockPage as any);
+      expect(cdpCalls.some((c) => c.method === 'Network.clearBrowserCookies')).toBe(true);
+      expect(cdpCalls.some((c) => c.method === 'Storage.clearDataForOrigin')).toBe(true);
+      expect(mockPage.close).toHaveBeenCalled();
+    });
+
+    it('TEST-W02: Account A authenticated state is never exposed to Account B in warm session', async () => {
+      const activeState = new Map<string, string>();
+      const mockPageA = {
+        goto: vi.fn().mockResolvedValue(undefined),
+        evaluate: vi.fn().mockResolvedValue(undefined),
+        title: vi.fn().mockResolvedValue('SpigotMC'),
+        createCDPSession: vi.fn().mockResolvedValue({
+          send: vi.fn().mockImplementation(async (method) => {
+            if (method === 'Network.clearBrowserCookies' || method === 'Storage.clearDataForOrigin') {
+              activeState.clear();
+            }
+            return {};
+          }),
+          detach: vi.fn().mockResolvedValue(undefined),
+        }),
+        mouse: { click: vi.fn(), move: vi.fn() },
+        keyboard: { type: vi.fn(), press: vi.fn() },
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+
+      // Account A sets token
+      activeState.set('xf_user', 'user_a_token_12345');
+      expect(activeState.get('xf_user')).toBe('user_a_token_12345');
+
+      // Session A completes and calls release
+      await warmBrowserManager.releaseSessionPage(mockPageA as any);
+      expect(activeState.size).toBe(0);
+
+      // Account B starts fresh page
+      const mockPageB = { ...mockPageA, close: vi.fn().mockResolvedValue(undefined) };
+      await warmBrowserManager.sanitizePage(mockPageB as any);
+      expect(activeState.has('xf_user')).toBe(false);
+    });
+
+    it('TEST-W03: crashed warm browser triggers clean restart and job recovery', async () => {
+      let isConnected = true;
+      let launchCount = 0;
+      const mockCloak = {
+        launch: vi.fn().mockImplementation(async () => {
+          launchCount++;
+          return {
+            close: vi.fn().mockResolvedValue(undefined),
+            process: () => null,
+            isConnected: () => isConnected,
+            pages: async () => [],
+            newPage: async () => ({
+              close: vi.fn().mockResolvedValue(undefined),
+            }),
+          };
+        }),
+      };
+
+      const baseConfig = { headless: true };
+      const session1 = await warmBrowserManager.acquireWarmBrowser(mockCloak as any, baseConfig);
+      expect(launchCount).toBe(1);
+
+      // Browser crashes
+      isConnected = false;
+
+      // Next job tries to acquire warm browser -> detects crash -> restarts browser
+      const session2 = await warmBrowserManager.acquireWarmBrowser(mockCloak as any, baseConfig);
+      expect(launchCount).toBe(2);
+      expect(session2.browser).not.toBe(session1.browser);
+    });
+
+    it('TEST-W04: 20 sequential jobs reuse single warm browser without resource growth', async () => {
+      let launchCount = 0;
+      const mockCloak = {
+        launch: vi.fn().mockImplementation(async () => {
+          launchCount++;
+          return {
+            close: vi.fn().mockResolvedValue(undefined),
+            process: () => null,
+            isConnected: () => true,
+            pages: async () => [],
+            newPage: async () => ({
+              close: vi.fn().mockResolvedValue(undefined),
+            }),
+          };
+        }),
+      };
+
+      const baseConfig = { headless: true };
+      for (let i = 0; i < 20; i++) {
+        const { browser } = await warmBrowserManager.acquireWarmBrowser(mockCloak as any, baseConfig);
+        const page = (await browser.newPage()) as BrowserSession['page'];
+        await warmBrowserManager.releaseSessionPage(page);
+      }
+
+      // Exact 1 launch for all 20 jobs
+      expect(launchCount).toBe(1);
+    });
+
+    it('TEST-W05: warm mode disabled (default) preserves exact cold ephemeral behavior', () => {
+      delete process.env.WARM_BROWSER_EXPERIMENT;
+      expect(warmBrowserManager.isWarmEnabled()).toBe(false);
+
+      process.env.WARM_BROWSER_EXPERIMENT = 'false';
+      expect(warmBrowserManager.isWarmEnabled()).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // Phase 4B-4: MICRO OPTIMIZATIONS
+  // =========================================================================
+  describe('Phase 4B-4 — Micro Optimizations', () => {
+    beforeEach(() => {
+      invalidateChromePathCache();
+    });
+
+    afterEach(() => {
+      invalidateChromePathCache();
+    });
+
+    it('TEST-M01: resolveChromePath memoizes resolved path and supports explicit cache invalidation', () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'chrome-memo-test-'));
+      const dummyChrome = join(tempDir, 'dummy-chrome.exe');
+      writeFileSync(dummyChrome, 'binary');
+
+      try {
+        const first = resolveChromePath(dummyChrome);
+        expect(first).toBe(dummyChrome);
+
+        // Remove file to test cache persistence
+        rmSync(dummyChrome, { force: true });
+
+        // Invalidate cache: must detect file is missing
+        invalidateChromePathCache();
+        const recheck = resolveChromePath(dummyChrome);
+        expect(recheck).toBeNull();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('TEST-M02: HierarchicalDeadline enforces parent deadline dominance over child operations', async () => {
+      // Parent job timeout is strictly 100ms
+      const jobDeadline = new HierarchicalDeadline({ jobTimeoutMs: 100 });
+
+      // Child requests 5,000ms, but parent must dominate and cap it at <= 100ms
+      const effectiveChildMs = jobDeadline.getChildDeadlineMs(5000);
+      expect(effectiveChildMs).toBeLessThanOrEqual(100);
+
+      const { signal, cleanup } = jobDeadline.createChildSignal(5000);
+      expect(signal.aborted).toBe(false);
+
+      // Wait for child signal to be aborted by dominated deadline
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+
+      expect(signal.aborted).toBe(true);
+      expect(signal.reason?.message ?? String(signal.reason)).toContain('Hết hạn deadline con');
+      cleanup();
+    });
+
+    it('TEST-M03: HierarchicalDeadline propagates parent abort signal immediately to child', () => {
+      const parentController = new AbortController();
+      const jobDeadline = new HierarchicalDeadline({
+        jobTimeoutMs: 100_000,
+        parentSignal: parentController.signal,
+      });
+
+      const { signal, cleanup } = jobDeadline.createChildSignal(50_000);
+      expect(signal.aborted).toBe(false);
+
+      // Parent aborts due to shutdown
+      parentController.abort('shutdown');
+
+      expect(signal.aborted).toBe(true);
+      expect(signal.reason).toBe('shutdown');
+      cleanup();
+    });
+
+    it('TEST-M04: Progress heartbeat prevents false-stall during extended operations', () => {
+      const tracker = new InstanceTracker();
+      tracker.registerWorker(99, 'TestWorker');
+      tracker.updateWorker(99, { status: 'downloading', progressText: 'Đang tải file 100MB...' });
+
+      // Initial check - active and healthy
+      expect(tracker.checkWatchdog(90_000)).toEqual([]);
+
+      // Send heartbeat
+      tracker.heartbeat(99, 'Đã tải 50MB...');
+      const worker = tracker.getAll().find((w) => w.id === 99);
+      expect(worker?.progressText).toBe('Đã tải 50MB...');
+      expect(worker?.isStalled).toBe(false);
+
+      // Watchdog check passes without flagging false stall
+      const stalled = tracker.checkWatchdog(90_000);
+      expect(stalled).toEqual([]);
+    });
   });
 });
