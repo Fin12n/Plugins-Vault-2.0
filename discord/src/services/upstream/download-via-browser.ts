@@ -77,6 +77,8 @@ export type BrowserDownloadDeps = {
   onProgress?: (bytes: number, status?: string) => void;
   expectedSha256?: string;
   downloadWaitMs?: number;
+  resourcePageUrl?: string;
+  downloadUrl?: string;
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -849,7 +851,8 @@ export async function downloadViaBrowser(
 
     log(`resource ${resourceId}: mở trang`);
 
-    const resourceWait = await openPastChallenge(page, `https://www.spigotmc.org/resources/${resourceId}/`, {
+    const resourcePage = deps.resourcePageUrl ?? `https://www.spigotmc.org/resources/${resourceId}/`;
+    const resourceWait = await openPastChallenge(page, resourcePage, {
       ...(deps.solver ? { solver: deps.solver } : {}),
       ...(deps.challengeTimings ? { timings: deps.challengeTimings } : {}),
       log,
@@ -980,7 +983,7 @@ export async function downloadViaBrowser(
         };
       }
     } else {
-      downloadUrl = (await findDownloadHref(page)) ?? `https://www.spigotmc.org/resources/${resourceId}/download`;
+      downloadUrl = deps.downloadUrl ?? (await findDownloadHref(page)) ?? `https://www.spigotmc.org/resources/${resourceId}/download`;
     }
 
     log(`  link tải: ${downloadUrl}`);
