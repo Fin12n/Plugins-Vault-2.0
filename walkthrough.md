@@ -18,6 +18,9 @@
 11. [PHASE 2 — Báo Cáo Kiểm Toán Kỹ Thuật Khởi Đầu (Initial Audit)](#11-phase-2--báo-cáo-kiểm-toán-kỹ-thuật-khởi-đầu-initial-audit)
 12. [PHASE 2 v3 — Kế Hoạch Triển Khai Toàn Diện & Chốt Chặn Nghiệm Thu Cuối Cùng (Final Implementation Plan v3)](#12-phase-2-v3--kế-hoạch-triển-khai-toàn-diện--chốt-chặn-nghiệm-thu-cuối-cùng-final-implementation-plan-v3)
 13. [PHASE 2 — Báo Cáo Triển Khai Thực Tế & Nghiệm Thu Kỹ Thuật Toàn Diện (Phase 2 Implementation & Acceptance Report)](#13-phase-2--báo-cáo-triển-khai-thực-tế--nghiệm-thu-kỹ-thuật-toàn-diện)
+14. [PHASE 3A — Nghiệm Thu & Khóa Chốt Triển Khai Payment Core (Phase 3A Closed)](#14-phase-3a--nghiệm-thu--khóa-chốt-triển-khai-payment-core-phase-3a-closed)
+15. [PHASE 3B — Triển Khai & Nghiệm Thu Delivery Reliability & Concurrency Hardening (Phase 3B Closed)](#15-phase-3b--triển-khai--nghiệm-thu-delivery-reliability--concurrency-hardening-phase-3b-closed)
+16. [PHASE 3C — Báo Cáo Kiểm Toán Kỹ Thuật Toàn Diện Kế Toán, Tất Toán & Đối Soát (Phase 3C Audit)](#16-phase-3c--báo-cáo-kiểm-toán-kỹ-thuật-toàn-diện-kế-toán-tất-toán--đối-soát-phase-3c-audit)
 
 ---
 
@@ -1175,5 +1178,277 @@ Exit Code: 0 (Đã biên dịch thành công dist/ và dist-server/)
 
 Toàn bộ các yêu cầu, quy tắc bảo mật, cơ chế chống deadlock và các ràng buộc kỹ thuật của **PHASE 2 IMPLEMENTATION PLAN v3** đã được thực thi và nghiệm thu thành công mỹ mãn. Hệ thống đạt trạng thái sẵn sàng cao (Production-Ready) cho các giai đoạn tiếp theo.
 
+---
 
+## 14. PHASE 3A — Nghiệm Thu & Khóa Chốt Triển Khai Payment Core (Phase 3A Closed)
+
+> **Trạng thái**: CLOSED & VERIFIED (Commit `04006ae`).
+> **Phạm vi**: Payment Core, SePay Ingestion, First-Insert Race Guard, Row-Lock Before Mutation, Dynamic Real-Amount Topup.
+
+### 🎯 Mục Tiêu Đã Hoàn Thành
+1. **First-Insert Race Guard & Atomic Ingestion**:
+   - Loại bỏ hoàn toàn kiểm tra race `hasSepayTransaction()` -> return duplicate.
+   - Thay thế bằng `INSERT ... ON CONFLICT DO NOTHING` + `SELECT ... FOR UPDATE`.
+   - Phân biệt rành mạch terminal (`ignored_outgoing`, `ignored_no_code`, `duplicate`) vs non-terminal (`unmatched`, `received`).
+2. **Order Payment Invariants (Invariant B)**:
+   - Nghiêm cấm mô hình `applyLedgerEntryTx` trước rồi mới lock order.
+   - Chuẩn hóa: `Lock wallets FOR UPDATE` -> `Lock orders FOR UPDATE` -> `Reload fresh state` -> `Quyết định trạng thái nghiệp vụ` -> `Biến động tài chính & Ledger` -> `Commit`.
+   - Bảo vệ tuyệt đối đơn không còn pending: nếu đơn đã thanh toán hoặc đã hủy, 100% tiền chuyển khoản được nạp vào ví khách (`order_overpay_credit`), không bao giờ mở lại đơn.
+3. **Dynamic Real-Amount Topup Policy (Invariant C)**:
+   - Khắc phục lỗ hổng credit số tiền ảo: Nạp đúng số tiền thực nhận (`transferAmount`) thay vì số tiền yêu cầu trong ticket (`topup.amount`).
+4. **Bằng Chứng Nghiệm Thu (Phase 3A Tests)**:
+   - 21/21 Unit & Integration tests tại `discord/tests/neon-payment-atomicity.test.ts` đạt 100% PASS.
+
+---
+
+## 15. PHASE 3B — Triển Khai & Nghiệm Thu Delivery Reliability & Concurrency Hardening (Phase 3B Closed)
+
+> **Trạng thái**: CLOSED & VERIFIED (Commit `a196ddc8e7235285f2a62460551d4b25376a4175`).
+> **Phạm vi**: Delivery Worker, Scheduler, Job Claiming, Lease/Reclaim, Exponential Backoff, Delivery Reservation Protocol v7, Heartbeat, Token Revocation.
+
+### 🎯 Mục Tiêu Đã Hoàn Thành
+1. **Delivery Reservation Protocol (Giao Thức Đặt Chỗ Chuyển Phát)**:
+   - Khi một job được claim bởi worker, trạng thái chuyển sang `processing`.
+   - Tuyệt đối cấm thao tác refund/cancel hoàn tất khi job đang `processing`. Thao tác bị từ chối với lỗi an toàn `DELIVERY_IN_PROGRESS`.
+   - Nếu job ở trạng thái `queued` hoặc `retryable`, refund/cancel sẽ hủy bỏ job giao hàng và thu hồi toàn bộ download token chưa sử dụng.
+2. **Conditional SQL Claim & State Guard**:
+   - `claimDeliveryJob` áp dụng SQL điều kiện ngặt nghèo:
+     - `queued -> processing`
+     - `retryable + next_retry_at <= now() -> processing`
+     - `processing + locked_at <= expired_threshold -> reclaim processing`
+   - Cấm vĩnh viễn việc claim lại các job đã ở trạng thái terminal (`delivered`, `failed`, `cancelled`).
+3. **Heartbeat & Fail-Safe Lease Loss**:
+   - Worker duy trì heartbeat gia hạn `locked_at` mỗi 15 giây.
+   - Nếu mất lease / heartbeat thất bại: Worker dừng ngay lập tức mọi thao tác ghi cơ sở dữ liệu (không update status, không ghi log), outcome cục bộ trả về `UNKNOWN`, tuân thủ ngữ nghĩa At-Least-Once Delivery an toàn.
+4. **Retry & Exponential Backoff**:
+   - Cơ chế lũy thừa `backoff = min(60 * 2^attempt, 3600)`.
+   - Quá `MAX_ATTEMPTS` (5 lần) tự động đánh dấu `failed` với lỗi nguyên nhân cụ thể (`dm_blocked`, `file_missing`, v.v.).
+5. **Bằng Chứng Nghiệm Thu (Phase 3B Tests & Quality Gates)**:
+   - Toàn bộ 19/19 Hardening tests tại `discord/tests/neon-delivery-hardening.test.ts` đạt 100% PASS (`TEST-B1` đến `TEST-B19`).
+   - Toàn bộ 911 tests toàn repo (`pnpm -r test`) đạt 100% PASS.
+   - Typecheck (`pnpm -r exec tsc --noEmit`): Exit code 0 (Clean).
+   - Build (`pnpm -r build`): Exit code 0 (Clean dist & dist-server).
+   - Git diff check (`git diff --check origin/main`): Exit code 0 (Clean).
+   - Source of truth commit: `a196ddc8e7235285f2a62460551d4b25376a4175` trên `origin/main`.
+   - **PHASE 3B ĐÃ CHÍNH THỨC KHÓA CHỐT VÀ NGHIỆM THU ĐÓNG (PHASE 3B = CLOSED)**.
+
+---
+
+## 16. PHASE 3C — Báo Cáo Kiểm Toán Kỹ Thuật Toàn Diện Kế Toán, Tất Toán & Đối Soát (Phase 3C Audit)
+
+> **Trạng thái**: AUDIT COMPLETED & PLAN APPROVED (Kế hoạch kỹ thuật lưu tại `plans/2026-10-05-phase-3c-accounting-settlement-reconciliation-plan.md`).
+> **Phạm vi**: Toàn bộ hệ thống hạch toán doanh thu, dòng tiền, hoàn tiền, thanh toán thiếu, sổ cái ví, và đối soát tự động trên Neon Authority.
+
+### 🎯 1. Kết Quả Kiểm Toán Mô Hình Tất Toán (Settlement Model)
+- **Chu trình Dòng tiền**:
+  - `orders.amount`: Tổng giá trị niêm yết của đơn hàng (Gross Price).
+  - `orders.walletPaid`: Khoản trừ trực tiếp từ số dư ví lúc tạo đơn (Wallet Liability Consumed).
+  - `orders.bankDue`: Khoản phải thu ngân hàng = `amount - walletPaid`.
+  - `orders.paidAmount`: Tiền mặt thực nhận qua SePay được ghi nhận vào đơn hàng.
+  - `settledAmount`: Hiện **chưa có cột vật lý** trong database, đang bị tính toán phân tán (ad-hoc) tại 4 vị trí khác nhau bằng biểu thức `walletPaid + (paidAmount ?? (status === 'wallet_paid' ? 0 : bankDue))`.
+
+### 🎯 2. Kết Quả Kiểm Toán Hạch Toán Doanh Thu (Revenue Accounting)
+- **7 Trụ Cột Tài Chính**: Phân biệt rạch ròi giữa **Bank Cash Received** (Dòng tiền mặt), **Wallet Topups** (Nghĩa vụ nợ), **Wallet-Funded Sales** (Doanh thu từ ví), **Overpayment/Partial Credit** (Nợ tăng thêm), **Settled Sales** (Doanh thu gộp), **Refunds** (Giảm trừ doanh thu), và **Net Sales** (Doanh thu thuần).
+- **Phát hiện P0 - Double-Deduction of Refunds**: Các truy vấn tính doanh thu đang dùng `WHERE status IN ('paid', 'delivered')`. Khi đơn bị hoàn tiền (`status = 'refunded'`), đơn bị văng khỏi tổng bán hàng. Nếu báo cáo trừ tiếp số tiền hoàn từ ledger thì tiền hoàn bị **trừ trùng 2 lần**, làm sai lệch doanh thu lịch sử.
+- **Phát hiện P0 - Omission of Wallet Payments**: Báo cáo tổng quan và tháng đang dùng `SUM(orders.paidAmount)`. Vì đơn trả 100% bằng ví có `paidAmount = NULL` và `status = 'wallet_paid'`, doanh thu từ ví bị tính bằng **0₫**.
+
+### 🎯 3. Kết Quả Kiểm Toán Hoàn Tiền (Refund Accounting)
+- **Phát hiện P0 - Rogue Refund Route trên Dashboard Server**: File `dashboard/server/routes/orders-routes.ts:380-425` tự triển khai transaction hoàn tiền riêng, ghi sổ cái với `kind = 'order_refund_credit'` (thay vì `order_refund`), đồng thời bỏ qua kiểm tra Delivery Reservation và không thu hồi token tải.
+- **Tính đối ứng của Split Payment**: Khi hoàn tiền đơn kết hợp (ví dụ 40k ví + 60k ngân hàng), ví người dùng nhận lại 100k coin. Tiền mặt 60k vẫn nằm ở tài khoản ngân hàng của shop và chuyển thành công nợ ví của shop đối với khách hàng.
+
+### 🎯 4. Kết Quả Kiểm Toán Thanh Toán Thiếu (Partial Payment)
+- **Business Policy**: Đơn 100k, khách chuyển 40k -> ví +40k (`order_partial_credit`), đơn pending; chuyển tiếp 60k -> ví +60k (`order_partial_credit`), đơn vẫn pending.
+- **Không Double-Count**: Tiền chuyển thiếu được ghi nhận là Nạp ví (Liability). Doanh thu bán hàng chỉ được ghi nhận một lần duy nhất khi khách dùng số dư ví đó để tất toán đơn hàng.
+
+### 🎯 5. Danh Mục Phát Hiện & Phân Loại Lỗi (P0 - P3 Findings)
+1. **[P0] Trừ 2 lần tiền hoàn (Double-Deduction of Refunds)**: `dashboard/server/routes/stats-routes.ts:20-25`.
+2. **[P0] Bỏ quên doanh thu từ ví (Wallet Sales Omission)**: `dashboard/server/routes/stats-routes.ts:21`.
+3. **[P0] Luồng hoàn tiền dị biệt & sai kind sổ cái**: `dashboard/server/routes/orders-routes.ts:406`.
+4. **[P1] Bảng xếp hạng nạp tiền bị chết do sai kind**: `dashboard/server/routes/stats-routes.ts:173` (lọc `kind = 'topup'` thay vì `topup_credit`).
+5. **[P1] Nhầm lẫn tiền nạp ví là doanh thu bán hàng**: `discord/src/services/stats/overview-stats.ts:134-147`.
+6. **[P1] Thiếu cột bất biến `settled_amount` trong Schema**: `packages/db/src/schema.ts:101-129, 292-328`.
+7. **[P2] Lọc doanh thu theo ngày tạo thay vì ngày tất toán**: `dashboard/server/routes/stats-routes.ts:38, 112`.
+8. **[P2] Điểm mù thanh toán thiếu trên giao diện Dashboard**: `dashboard/server/routes/orders-routes.ts:45-64`.
+9. **[P2] Bot monthly fund stats truy vấn nhầm SQLite**: `discord/src/services/stats/monthly-fund-stats.ts:16-38`.
+10. **[P3] Thiếu endpoint đối soát tự động diện rộng**: `dashboard/server/routes/wallets-routes.ts:151-174`.
+
+### 🎯 6. Kế Hoạch Triển Khai Kỹ Thuật Phase 3C v6 (Implementation Plan v6 — Final Accounting Corrections)
+1. **Bước 1 — Schema Migration & Chuẩn Hóa Ngoại Lệ (Source + Run ID)**:
+   - Thêm cột `orders.settled_amount` kèm ràng buộc `CHECK (settled_amount IS NULL OR settled_amount >= 0)`.
+   - Tạo bảng persistent `_migration_exceptions` là "Migration / Reconciliation / Data Integrity Exception Store" (`id`, `source`, `run_id`, `entity_type`, `entity_id`, `reason_code`, `evidence` [jsonb], `created_at`, `resolved_at`) có unique index đảm bảo tính idempotent `UNIQUE (source, run_id, entity_type, entity_id, reason_code)`, lưu trữ các sai lệch di trú (`source = 'migration'`), đối soát runtime (`source = 'runtime_reconciliation'`), và vi phạm dữ liệu khi giao hàng (`source = 'runtime_worker'`); tuyệt đối cấm lưu password, cookie, session, token, secret.
+2. **Bước 2 — Gia Cố Tuyệt Đối Settlement Helpers & Khóa Chặt Cửa Sau Generic Writer**:
+   - Thiết kế 2 hàm chuyên biệt đã gia cố (hardened helpers): `settleOrderPaidTx(...)` và `settleOrderWalletPaidTx(...)`.
+   - Hàm tự động lock và reload đơn hàng từ DB (`FOR UPDATE`), tự gán `canonicalAmount = order.amount`, tự nạp timestamp có thẩm quyền từ DB (`sepay.received_at` hoặc `ledger.created_at`), và reject nếu caller cố tình truyền `amount` hoặc `paidAt` sai lệch.
+   - Commit đồng thời trong **SAME database transaction**: `status`, `settled_amount`, `paid_at`, và payment/ledger state.
+   - Hàm generic `updateOrderStatus()` chỉ xử lý các chuyển đổi trạng thái phi tài chính. Tuyệt đối cấm caller tùy tiện gọi `updateOrderStatus(orderId, "paid")` mà không có context tài chính (bị rejected / unavailable).
+   - Ngăn chặn tuyệt đối các đơn terminal (`refunded`, `cancelled`, `expired`, `delivered`) bị mở lại hoặc ghi đè `settled_amount`.
+3. **Bước 3 — Chuẩn Hóa Ngữ Nghĩa `paid_at` (Option B: Actual Payment Receipt Timestamp)**:
+   - Thanh toán ngân hàng: Sử dụng timestamp nhận tiền thực tế tin cậy từ SePay (`received_at`). Tuyệt đối không tự động lấy `processed_at` nếu không chứng minh được đó là thời điểm nhận tiền; tuyệt đối cấm dùng webhook processing time hay `order.created_at`.
+   - Thanh toán kết hợp (Split payment): Sử dụng timestamp của giao dịch ngân hàng thực tế hoàn tất đơn hàng (`sepay_transactions.received_at`).
+   - Thanh toán 100% ví: Sử dụng timestamp trừ ví thành công (`wallet_ledger.created_at` với `kind = 'order_hold'`).
+   - Đơn hàng 0₫: Sử dụng timestamp tạo đơn và chốt `wallet_paid`.
+   - `paid_at` là bất biến sau khi tất toán: Idempotent retry giữ nguyên vẹn 100% timestamp và `settled_amount`.
+4. **Bước 4 — Phân Tách Hai Miền Kế Toán: Nguồn Doanh Thu Trực Tiếp Từ `orders` vs Lượt Giao Từ `delivery_logs`**:
+   - **Doanh thu có thể tồn tại TRƯỚC khi giao hàng**: Đơn hàng đã tất toán (có `settled_amount` và `paid_at`) ngay lập tức được ghi nhận vào doanh thu Settled Sales và doanh thu per-plugin/per-user, dù hàng chưa được giao xong.
+   - **TUYỆT ĐỐI KHÔNG YÊU CẦU `delivery_logs` KHI TÍNH DOANH THU**.
+   - Báo cáo doanh thu per-plugin và per-user trích xuất trực tiếp từ bảng `orders` qua quan hệ canonical `orders → orders.version_id → versions.plugin_id` với điều kiện `o.settled_amount IS NOT NULL AND o.paid_at >= :from AND o.paid_at < :to`.
+   - Lượt giao hàng nghiệp vụ (`business delivery count`) tính riêng từ `delivery_logs` bằng `COUNT(DISTINCT order_id)`.
+   - Bảng `delivery_logs` chỉ là bằng chứng giao hàng thành công (successful delivery evidence only), không dùng metadata log làm canonical plugin identity.
+   - Lỗi `DATA_INTEGRITY_VIOLATION` (đơn thiếu `settled_amount` lúc giao): Chuyển thẳng sang permanent failure, không retry tự động (no transient retry loop).
+5. **Bước 5 — Chuẩn Hóa Bank Cash Received**:
+   - Tổng tiền mặt ngân hàng nhận = tất cả giao dịch SePay có `transfer_type = 'in'`.
+   - Phân loại theo quan hệ thực thể: Matched Cash (`order_id IS NOT NULL OR topup_id IS NOT NULL`) vs Unmatched/Unclassified Cash (`order_id IS NULL AND topup_id IS NULL`, bao gồm cả `ignored_no_code`).
+6. **Bước 6 — Xác Nhận Chính Sách Đơn 0₫ (Option B)**:
+   - Plugin miễn phí tạo đơn 0₫ là hợp lệ: `amount = 0`, `walletPaid = 0`, `bankDue = 0`, `status = 'wallet_paid'`, `settled_amount = 0`. Check constraint: `settled_amount >= 0`.
+7. **Bước 7 — Hợp Nhất Hoàn Tiền**:
+   - Thay thế toàn bộ logic hoàn tiền tự chế trên Dashboard bằng hàm chuẩn `refundOrderWallet`, dọn sạch `order_refund_credit` -> `order_refund`.
+8. **Bước 8 — Reconciliation Engine Đa Tầng (NULL-Safe)**:
+   - Mở rộng endpoint `/api/wallets/reconcile` lên 7 chốt chặn tự động toàn diện Check A -> G với cú pháp an toàn trước giá trị NULL (`o.id IS NULL OR dl.amount IS DISTINCT FROM o.settled_amount`).
+9. **Bước 9 — Bộ Test Chấp Nhận Toàn Diện (40 Kịch Bản `TEST-C01` -> `TEST-C40`)**:
+   - Định nghĩa chi tiết và bao phủ 100% các case nghiệp vụ kế toán, đối soát, deduplication, state guard, zero-price, idempotent retry, orphan log, data integrity protection, delayed webhook at month boundary (`TEST-C32`), canonical deduplication (`TEST-C33`), generic `updateOrderStatus("paid")` rejection (`TEST-C34`), settled order before delivery included in revenue (`TEST-C35`), two settled orders same plugin revenue directly from orders (`TEST-C36`), runtime exception source/run identity (`TEST-C37`), received_at over processed_at (`TEST-C38`), caller wrong amount rejection (`TEST-C39`), và caller wrong paidAt rejection (`TEST-C40`).
+10. **Bước 10 — Chiến Lược Hoàn Tác An Toàn (Non-Destructive Rollback)**:
+    - Hoàn tác ứng dụng về Phase 3B bảo toàn 100% cột `settled_amount`, dữ liệu tài chính đã ghi nhận và bảng `_migration_exceptions`. Tuyệt đối không drop bảng/cột trên production.
+
+---
+
+> **KẾT LUẬN GIAI ĐOẠN**: Kế hoạch kỹ thuật **PHASE 3C v6** tại `plans/2026-10-05-phase-3c-accounting-settlement-reconciliation-plan.md` đã hoàn tất toàn bộ các chốt chặn của Final Gate. **READY FOR IMPLEMENTATION (SẴN SÀNG TRIỂN KHAI)**.
+
+---
+
+# GIAI ĐOẠN 3C — TRIỂN KHAI HỆ THỐNG KẾ TOÁN TẤT TOÁN, DOANH THU & ĐỐI SOÁT ĐA TẦNG (PHASE 3C IMPLEMENTATION WALKTHROUGH)
+
+> **Mục tiêu**: Xây dựng nền tảng tài chính chính xác (Canonical Settlement & Revenue Accounting), lưu trữ ngoại lệ đối soát (`_migration_exceptions`), giao hàng kế toán nghiêm ngặt (`delivery_logs.amount = orders.settled_amount`), đối soát đa tầng tự động (Checks A–G), và chuyển dịch toàn bộ báo cáo doanh thu hàng tháng sang Neon PostgreSQL.
+
+---
+
+## 1. TỔNG QUAN CÁC THAY ĐỔI ĐÃ THỰC HIỆN
+
+### 1.1. Database Schema & Migrations (`packages/db`)
+- **Cột `orders.settled_amount`**: Kiểu `integer`, `nullable` khi đơn chưa tất toán, mang giá trị bất biến sau khi tất toán thành công (`settled_amount = order.amount`, hoặc `0` cho đơn 0₫). Có check constraint `chk_orders_settled_amount_non_negative` (`settled_amount >= 0`).
+- **Chỉ mục hiệu năng**: `idx_orders_settled_paid_at` trên `(settled_amount, paid_at)` phục vụ truy vấn doanh thu thời gian thực và đối soát.
+- **Bảng `_migration_exceptions`**: Lưu vết chi tiết mọi sai lệch dữ liệu, backfill exception hoặc runtime reconciliation exception.
+  - Cột: `id`, `source`, `run_id`, `entity_type`, `entity_id`, `reason_code`, `evidence` (jsonb), `created_at`, `resolved_at`.
+  - Composite unique index: `uq_migration_exceptions_record` trên `(source, run_id, entity_type, entity_id, reason_code)`.
+- **Drizzle SQL Migrations**:
+  - `0004_settled_amount.sql`: Thêm `orders.settled_amount` an toàn, idempotent (`IF NOT EXISTS`), check constraint và index.
+  - `0005_phase_3c_settlement_accounting.sql`: Khởi tạo bảng `_migration_exceptions` và index đối soát.
+
+### 1.2. Settlement Domain Engine (`discord/src/repositories/neon-settlement.ts`)
+- **`settleOrderPaidTx`**: Hàm duy nhất chịu trách nhiệm tất toán đơn hàng chuyển khoản / thanh toán hỗn hợp:
+  - Khóa bi quan `FOR UPDATE` bảo vệ đơn hàng.
+  - Kiểm tra trạng thái: từ chối các đơn terminal (`delivered`, `cancelled`, `refunded`, `failed`).
+  - Ghi nhận `settled_amount = lockedOrder.amount` và `paid_at = sepayTx.receivedAt` (nguồn `received_at` chuẩn từ SePay, từ chối tham số caller bị làm giả).
+  - Idempotent: nếu đơn đã ở trạng thái `paid`/`wallet_paid`, trả về kết quả an toàn mà không ghi đè dữ liệu.
+- **`settleOrderWalletPaidTx`**: Tất toán đơn thuần ví hoặc đơn 0₫:
+  - Đối với đơn 0₫: `settled_amount = 0`, `paid_at = now`.
+  - Đối với đơn thanh toán ví: `settled_amount = lockedOrder.amount`, `paid_at = ledgerCreatedAt`.
+- **`recordMigrationException`**: Helper ghi nhận exception độc lập, an toàn và chống trùng lặp.
+- **Bảo vệ `updateOrderStatus` (`discord/src/repositories/neon-orders.ts`)**:
+  - Ngăn chặn các hàm generic đổi trạng thái sang `paid` hoặc `wallet_paid` trái phép mà không qua helper tất toán tài chính chuyên dụng.
+  - Chặn mở lại các đơn terminal sang `pending`.
+
+### 1.3. Payment Core Integration (`discord/src/services/payment/neon-payment-flow.ts`)
+- `openOrderNeon`: Tự động gán `settledAmount: 0` khi tạo đơn 0₫ (`bankDue === 0`), và `settledAmount: null` khi đơn chờ thanh toán.
+- `applySepayTransferNeon`:
+  - Luôn sử dụng `settleOrderPaidTx` trong transaction tất toán để cập nhật đồng bộ `status`, `settledAmount`, và `paidAt`.
+  - Bảo toàn `receivedAt` có thẩm quyền từ SePay payload.
+  - Chuẩn hóa lưu vết `topupId: null` và `rawPayload` cho giao dịch SePay.
+
+### 1.4. Delivery Accounting Hardening (`discord/src/services/delivery/neon-delivery-worker.ts`)
+- **Nguyên tắc cốt lõi**: `delivery_logs` chỉ là bằng chứng giao hàng thành công (successful delivery evidence only).
+- **Trị số giao hàng kế toán**: `delivery_logs.amount = orders.settled_amount`. Tuyệt đối không fallback về `order.amount`, `walletPaid`, `bankDue`, hoặc `paidAmount`.
+- **Bảo vệ toàn vẹn dữ liệu (Data Integrity Protection)**:
+  - Tại Bước 5 (Delivery Accounting) khi chuẩn bị ghi nhận `delivery_logs`: Nếu `order.settledAmount == null`, hệ thống phát hiện vi phạm toàn vẹn dữ liệu nghiêm trọng.
+  - Ngay lập tức đánh dấu job là vĩnh viễn thất bại: `job.status = 'failed'`, `job.last_error = 'DATA_INTEGRITY_VIOLATION'`.
+  - Ghi nhận ngoại lệ vào `_migration_exceptions` với `source = 'runtime_delivery_accounting'`, `reason_code = 'DATA_INTEGRITY_VIOLATION'`.
+  - Tuyệt đối không thử lại tự động (no transient retry loop).
+
+### 1.5. Refund Accounting & Ledger Consolidation
+- Hợp nhất hoàn tiền trên toàn hệ thống qua `refundOrderWallet`.
+- Bút toán hoàn tiền: `wallet_ledger` với `kind = 'order_refund'`, `ref_type = 'order'`, `ref_id = order.id`, `delta > 0`.
+- Hoàn tiền bảo toàn nguyên vẹn `orders.settled_amount` và lịch sử `orders.paid_at`.
+- Báo cáo Net Sales = Settled Sales Gross - Refunds (tổng bút toán `order_refund`).
+
+### 1.6. Multi-Layer Reconciliation Engine (`dashboard/server/routes/wallets-routes.ts` & `neon-reconciliation.ts`)
+Triển khai toàn diện 7 chốt chặn đối soát tự động:
+- **Check A (Wallet Balance vs Ledger Sum)**: Kiểm tra chênh lệch số dư ví và tổng bút toán ledger.
+- **Check B (Settled Order vs Settled Amount)**: Phát hiện đơn đã trả tiền (`paid`, `wallet_paid`, `delivered`) nhưng thiếu `settled_amount` hoặc `paid_at`.
+- **Check C (Delivery Log vs Order Settled Amount)**: Kiểm tra lệch giá trị giao hàng sử dụng cú pháp an toàn `o.id IS NULL OR dl.amount IS DISTINCT FROM o.settled_amount`.
+- **Check D (Refunded Order vs Ledger Refund)**: Kiểm tra đơn trạng thái `refunded` nhưng thiếu bút toán `order_refund` hợp lệ.
+- **Check E (Inbound SePay Cash Reconciliation)**: Phân loại dòng tiền SePay: Matched Cash (`order_id IS NOT NULL OR topup_id IS NOT NULL`) vs Unmatched Cash (`order_id IS NULL AND topup_id IS NULL`).
+- **Check F (Wallet-Paid Missing Settled Amount)**: Phát hiện đơn `wallet_paid` nhưng chưa có `settled_amount`.
+- **Check G (Terminal State / Invalid Reopen)**: Phát hiện đơn hàng bị đổi ngược trạng thái từ terminal sang non-terminal.
+
+### 1.7. Monthly Reporting Engine on Neon (`discord/src/services/stats/neon-monthly-stats.ts` & `stats-routes.ts`)
+- Thay thế hoàn toàn báo cáo dựa trên SQLite audit log bằng truy vấn trực tiếp trên Neon PostgreSQL.
+- Doanh thu bán hàng (Settled Sales) và doanh thu theo Plugin/User được truy vấn **trực tiếp từ `orders`** dựa trên `orders.settled_amount` và thời gian `orders.paid_at` (doanh thu tồn tại ngay khi đơn tất toán, không phụ thuộc `delivery_logs`).
+- Doanh thu theo plugin sử dụng quan hệ chuẩn hóa: `orders → versions → plugins`, deduplicate theo `order.id`.
+- Tiền mặt ngân hàng nhận (Bank Cash Received) lọc từ `sepay_transactions` có `transfer_type = 'in'` và thời điểm `received_at`.
+- Số lượt giao hàng nghiệp vụ (Successful Deliveries) tính bằng `COUNT(DISTINCT delivery_logs.order_id)`.
+
+### 1.8. Historical Backfill Script (`discord/src/scripts/backfill-settled-amount.ts`)
+- Script backfill an toàn, idempotent, có thể chạy lại nhiều lần không gây lỗi.
+- Chỉ backfill `settled_amount` và `paid_at` khi có bằng chứng đáng tin cậy:
+  - Đơn chuyển khoản SePay: `sepay_transactions.received_at`.
+  - Đơn thanh toán ví: `wallet_ledger.created_at` (bút toán `order_hold`).
+  - Đơn 0₫: thời điểm tạo đơn hoặc cập nhật.
+- Ghi nhận các bản ghi thiếu bằng chứng tin cậy vào `_migration_exceptions` với run ID duy nhất, không tự ý bịa đặt dữ liệu.
+
+---
+
+## 2. KẾT QUẢ KIỂM THỬ VÀ BẢO ĐẢM CHẤT LƯỢNG (QUALITY GATES)
+
+### 2.1. Bộ Test Chấp Nhận Phase 3C (`TEST-C01` -> `TEST-C40`)
+Tất cả 40 kịch bản kiểm thử độc lập đã chạy và **vượt qua 100%**:
+- `TEST-C01`: Đơn mới tạo có `settled_amount = null`.
+- `TEST-C02`: Đơn 0₫ được tất toán với `settled_amount = 0`.
+- `TEST-C03`: Đơn chuyển khoản SePay tất toán đầy đủ mang `settled_amount = amount`.
+- `TEST-C04`: Đơn thanh toán kết hợp Ví + SePay mang `settled_amount = amount`.
+- `TEST-C05`: Tất toán idempotent không thay đổi `settled_amount` hoặc `paid_at`.
+- `TEST-C06`: Từ chối tất toán đơn hàng đã ở trạng thái terminal.
+- `TEST-C07`: `updateOrderStatus` generic bị chặn không cho phép đổi trạng thái sang `paid`.
+- `TEST-C08`: `updateOrderStatus` generic không cho phép mở lại đơn terminal.
+- `TEST-C09`: `delivery_logs.amount` luôn lấy chính xác từ `orders.settled_amount`.
+- `TEST-C10`: Đơn 0₫ tạo `delivery_logs.amount = 0` hợp lệ.
+- `TEST-C11`: Giao hàng đơn thiếu `settled_amount` kích hoạt `DATA_INTEGRITY_VIOLATION`.
+- `TEST-C12`: `DATA_INTEGRITY_VIOLATION` không kích hoạt vòng lặp retry tự động.
+- `TEST-C13`: Báo cáo doanh thu Settled Sales trích xuất trực tiếp từ `orders.settled_amount`.
+- `TEST-C14`: Doanh thu theo Plugin tổng hợp trực tiếp từ quan hệ `orders → versions → plugins`.
+- `TEST-C15`: Doanh thu theo Khách hàng tổng hợp trực tiếp từ `orders`.
+- `TEST-C16`: Báo cáo số lượt giao hàng nghiệp vụ tính bằng `COUNT(DISTINCT order_id)`.
+- `TEST-C17`: Tiền mặt SePay vào phân loại chính xác Matched Cash vs Unmatched Cash.
+- `TEST-C18`: Giao dịch SePay không có mã khớp đơn được tính vào Unmatched Cash.
+- `TEST-C19`: Hoàn tiền qua ví tạo bút toán `order_refund` trên `wallet_ledger`.
+- `TEST-C20`: Hoàn tiền không ghi đè `orders.settled_amount` hoặc `orders.paid_at`.
+- `TEST-C21`: Net Sales được tính chính xác bằng Gross Settled Sales trừ Refunds.
+- `TEST-C22`: Check A phát hiện lệch số dư ví và tổng ledger.
+- `TEST-C23`: Check B phát hiện đơn đã tất toán nhưng thiếu `settled_amount`.
+- `TEST-C24`: Check C phát hiện lệch giá trị giữa `delivery_logs` và `orders.settled_amount`.
+- `TEST-C25`: Check D phát hiện đơn `refunded` nhưng thiếu bút toán ledger `order_refund`.
+- `TEST-C26`: Check E đối soát chính xác tiền SePay Matched và Unmatched.
+- `TEST-C27`: Check F phát hiện đơn `wallet_paid` thiếu `settled_amount`.
+- `TEST-C28`: Check G phát hiện hành vi mở lại đơn terminal trái phép.
+- `TEST-C29`: Thao tác ghi ngoại lệ `_migration_exceptions` thành công và đúng cấu trúc.
+- `TEST-C30`: Bảng `_migration_exceptions` không lưu trữ thông tin nhạy cảm.
+- `TEST-C31`: Script backfill cập nhật đúng `settled_amount` và `paid_at` từ bằng chứng SePay/Ledger.
+- `TEST-C32`: Webhook SePay đến trễ qua ranh giới tháng ghi nhận doanh thu theo `received_at`.
+- `TEST-C33`: Deduplication doanh thu plugin theo ID đơn hàng không bị nhân đôi.
+- `TEST-C34`: Lệnh gọi `updateOrderStatus('paid')` bị từ chối triệt để.
+- `TEST-C35`: Đơn hàng đã tất toán được ghi nhận doanh thu ngay cả trước khi giao hàng.
+- `TEST-C36`: Hai đơn hàng cho cùng một plugin được tính gộp trực tiếp từ `orders`.
+- `TEST-C37`: Runtime exception ghi nhận đúng `source` và `run_id` duy nhất.
+- `TEST-C38`: Thời điểm tất toán luôn ưu tiên `received_at` của SePay thay vì `processed_at`.
+- `TEST-C39`: Từ chối tham số số tiền sai lệch do caller truyền vào.
+- `TEST-C40`: Từ chối tham số timestamp sai lệch do caller truyền vào.
+
+### 2.2. Kiểm thử Toàn bộ Hệ thống (Regression Test Suite)
+- **Toàn bộ monorepo (`pnpm -r test`)**:
+  - **43/43 file test đã vượt qua** (100%).
+  - **951/951 test cases đã vượt qua** (100%).
+  - Không có bất kỳ lỗi hồi quy nào đối với Payment Core 3A, Delivery Core 3B, Phase 1.5, hoặc Phase 2.
+
+### 2.3. Typecheck & Build Gates
+- **`pnpm -r exec tsc --noEmit`**: Vượt qua (0 lỗi type).
+- **`pnpm -r build`**: Vượt qua (0 lỗi build client/server/bot).
+- **`git diff --check`**: Vượt qua (0 cảnh báo khoảng trắng hoặc conflict markers).
 

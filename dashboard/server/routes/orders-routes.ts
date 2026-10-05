@@ -378,6 +378,25 @@ export function registerOrdersRoutes(app: FastifyInstance) {
           throw new Error(`INVALID_STATUS:${lockedOrder.status}`);
         }
 
+        // 3.1. Delivery Reservation Check (Delivery Reservation Protocol v7)
+        const [activeJob] = await tx
+          .select({ status: deliveryJobs.status })
+          .from(deliveryJobs)
+          .where(eq(deliveryJobs.orderId, id))
+          .limit(1);
+
+        if (activeJob) {
+          if (activeJob.status === 'processing') {
+            throw new Error(`DELIVERY_IN_PROGRESS: Đơn hàng #${id} đang trong tiến trình chuyển phát, không thể hoàn tiền`);
+          }
+          if (activeJob.status === 'queued' || activeJob.status === 'retryable' || activeJob.status === 'failed') {
+            await tx
+              .update(deliveryJobs)
+              .set({ status: 'cancelled', updatedAt: new Date() })
+              .where(eq(deliveryJobs.orderId, id));
+          }
+        }
+
         // 4. Tính toán số tiền hoàn dựa trên thực nhận
         const bankReceived =
           lockedOrder.paidAmount ??
@@ -398,12 +417,12 @@ export function registerOrdersRoutes(app: FastifyInstance) {
           })
           .where(eq(wallets.discordUserId, pre.discordUserId));
 
-        // 6. Ghi nhận sổ cái ví (wallet_ledger)
+        // 6. Ghi nhận sổ cái ví (wallet_ledger) với kind = 'order_refund'
         await tx.insert(walletLedger).values({
           discordUserId: pre.discordUserId,
           delta: refundAmount,
           balanceAfter: newBalance,
-          kind: 'order_refund_credit',
+          kind: 'order_refund',
           refType: 'order',
           refId: lockedOrder.id,
           note: `Hoàn tiền đơn hàng #${lockedOrder.code} (${lockedOrder.pluginName}): ${refundReason}`,

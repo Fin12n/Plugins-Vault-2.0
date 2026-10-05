@@ -113,6 +113,7 @@ export const orders = pgTable(
     walletPaid: integer("wallet_paid").default(0).notNull(),
     bankDue: integer("bank_due").default(0).notNull(),
     paidAmount: integer("paid_amount"),
+    settledAmount: integer("settled_amount"),
     status: varchar("status", { length: 20 }).default("pending").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
@@ -125,6 +126,9 @@ export const orders = pgTable(
     index("idx_orders_user").on(table.discordUserId),
     index("idx_orders_version_id").on(table.versionId),
     index("idx_orders_code").on(table.code),
+    index("idx_orders_settled_amount").on(table.settledAmount),
+    index("idx_orders_paid_at").on(table.paidAt),
+    check("chk_orders_settled_amount_non_negative", sql`settled_amount IS NULL OR settled_amount >= 0`),
   ]
 );
 
@@ -580,6 +584,35 @@ export const migrationCheckpoints = pgTable(
     startedAt: timestamp("started_at", { withTimezone: true }).defaultNow().notNull(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
   }
+);
+
+// ============================================================================
+// 11. MIGRATION & RECONCILIATION EXCEPTIONS STORE
+// ============================================================================
+export const migrationExceptions = pgTable(
+  "_migration_exceptions",
+  {
+    id: serial("id").primaryKey(),
+    source: varchar("source", { length: 32 }).notNull(), // 'migration' | 'runtime_reconciliation' | 'runtime_worker'
+    runId: varchar("run_id", { length: 64 }).notNull(),
+    entityType: varchar("entity_type", { length: 32 }).notNull(),
+    entityId: integer("entity_id").notNull(),
+    reasonCode: varchar("reason_code", { length: 64 }).notNull(),
+    evidence: jsonb("evidence").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  },
+  (table) => [
+    index("idx_migration_exceptions_entity").on(table.entityType, table.entityId),
+    index("idx_migration_exceptions_reason").on(table.reasonCode),
+    uniqueIndex("idx_migration_exceptions_uniq").on(
+      table.source,
+      table.runId,
+      table.entityType,
+      table.entityId,
+      table.reasonCode
+    ),
+  ]
 );
 
 // ============================================================================

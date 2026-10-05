@@ -720,8 +720,8 @@ describe('PHASE 1.5 — PRODUCTION REHEARSAL AUDIT', () => {
       expect(dashboardTopupView).toBeDefined();
       expect(dashboardTopupView?.amount).toBe(200_000);
 
-      // 3. Dashboard mutates order status (e.g. manual release or admin action)
-      await updateOrderStatus(stagingDb, order.id, 'paid', 80_000);
+      // 3. Dashboard mutates order status (e.g. manual release or admin action with verified settlement context)
+      await updateOrderStatus(stagingDb, order.id, 'paid', 80_000, { settlementContext: true });
 
       // 4. Discord Bot queries updated state
       const discordOrderQuery = await findOrderByCode(stagingDb, 'ORD-DISCORD-1');

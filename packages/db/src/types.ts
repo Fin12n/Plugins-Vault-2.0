@@ -80,3 +80,6 @@ export type NewCardTopup = InferInsertModel<typeof schema.cardTopups>;
 
 export type MigrationCheckpoint = InferSelectModel<typeof schema.migrationCheckpoints>;
 export type NewMigrationCheckpoint = InferInsertModel<typeof schema.migrationCheckpoints>;
+
+export type MigrationException = InferSelectModel<typeof schema.migrationExceptions>;
+export type NewMigrationException = InferInsertModel<typeof schema.migrationExceptions>;

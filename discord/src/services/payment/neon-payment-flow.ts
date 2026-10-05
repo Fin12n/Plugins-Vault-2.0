@@ -14,6 +14,7 @@ import {
 } from "@vault/db";
 import { applyLedgerEntryTx } from "../../repositories/neon-wallets.js";
 import { findOrderByCode } from "../../repositories/neon-orders.js";
+import { settleOrderPaidTx } from "../../repositories/neon-settlement.js";
 import { findTopupByCode } from "../../repositories/neon-wallet-topups.js";
 import { isTerminalSepayStatus } from "../../repositories/neon-sepay.js";
 import { assertNotFrozen } from "../maintenance/write-freeze.js";
@@ -46,8 +47,8 @@ export async function applySepayTransferNeon(
     const inserted = await tx
       .insert(sepayTransactions)
       .values({
-        sepayId: payload.id,
-        amount: payload.transferAmount,
+        sepayId: payload.id ?? (payload as any).sepayId,
+        amount: payload.transferAmount ?? (payload as any).amount,
         transferType: payload.transferType,
         code: payload.code,
         content: payload.content || "",
@@ -56,7 +57,12 @@ export async function applySepayTransferNeon(
         orderId: null,
         topupId: null,
         rawPayload: payload as unknown as Record<string, unknown>,
-        receivedAt: new Date(),
+        receivedAt:
+          (payload as any).receivedAt instanceof Date
+            ? (payload as any).receivedAt
+            : payload.transactionDate
+            ? new Date(payload.transactionDate)
+            : new Date(),
       })
       .onConflictDoNothing({ target: sepayTransactions.sepayId })
       .returning();
@@ -146,7 +152,7 @@ async function handleOrderPaymentNeonTx(
   sepayRow: SepayTransaction,
   orderPre: Order
 ): Promise<WebhookOutcome> {
-  const transferAmount = payload.transferAmount;
+  const transferAmount = payload.transferAmount ?? (payload as any).amount;
 
   // Step 2: Lock wallets FIRST với FOR UPDATE
   await tx
@@ -258,15 +264,12 @@ async function handleOrderPaymentNeonTx(
 
   if (transferAmount === bankDue) {
     // B2: Khớp đúng số tiền (Exact Payment)
-    // Không biến động ví vì không thừa/thiếu
-    await tx
-      .update(orders)
-      .set({
-        status: "paid",
-        paidAmount: transferAmount,
-        paidAt: new Date(),
-      })
-      .where(eq(orders.id, freshOrder.id));
+    // Settle order via canonical settlement helper (atomic status + settled_amount + paid_at)
+    await settleOrderPaidTx(tx, {
+      orderId: freshOrder.id,
+      paidAmount: transferAmount,
+      sepayTransactionId: sepayRow.id,
+    });
 
     // Step 5: Enqueue delivery_job
     if (freshOrder.versionId) {
@@ -318,14 +321,11 @@ async function handleOrderPaymentNeonTx(
     note: `Chuyển khoản thừa đơn hàng #${freshOrder.code} (dư ${surplus}đ)`,
   });
 
-  await tx
-    .update(orders)
-    .set({
-      status: "paid",
-      paidAmount: bankDue,
-      paidAt: new Date(),
-    })
-    .where(eq(orders.id, freshOrder.id));
+  await settleOrderPaidTx(tx, {
+    orderId: freshOrder.id,
+    paidAmount: bankDue,
+    sepayTransactionId: sepayRow.id,
+  });
 
   // Step 5: Enqueue delivery_job
   if (freshOrder.versionId) {
@@ -509,6 +509,7 @@ export async function openOrderNeon(
         const now = new Date();
         const expiresAt = new Date(now.getTime() + config.ttlMinutes * 60_000);
         const status = bankDue === 0 ? "wallet_paid" : "pending";
+        const settledAmount = bankDue === 0 ? price : null;
 
         // Step 3: Insert orders
         const [created] = await tx
@@ -522,6 +523,7 @@ export async function openOrderNeon(
             amount: price,
             walletPaid,
             bankDue,
+            settledAmount,
             status,
             createdAt: now,
             expiresAt,

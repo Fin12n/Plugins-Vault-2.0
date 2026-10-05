@@ -57,19 +57,57 @@ export async function findOrderById(
   return result[0] ?? null;
 }
 
+export {
+  settleOrderPaidTx,
+  settleOrderWalletPaidTx,
+  type SettleOrderPaidInput,
+  type SettleOrderWalletPaidInput,
+} from "./neon-settlement.js";
+
+export interface UpdateOrderStatusOptions {
+  settlementContext?: boolean;
+}
+
+const TERMINAL_ORDER_STATUSES = ["refunded", "cancelled", "expired", "delivered"];
+
 /**
- * Cập nhật trạng thái đơn hàng khi SePay báo đã thanh toán hoặc giao hàng.
- * Áp dụng State Guard: status 'delivered' chỉ được phép chuyển từ 'paid' hoặc 'wallet_paid'.
- * Tuyệt đối không ghi đè lên các đơn đã 'refunded' hoặc 'cancelled'.
+ * Cập nhật trạng thái đơn hàng phi tài chính (delivered, expired, underpaid, cancelled).
+ * Áp dụng State Guard:
+ * - Generic updateOrderStatus tuyệt đối không được tạo settlement fact.
+ * - Caller tùy tiện gọi updateOrderStatus(id, "paid") mà không có settlement context sẽ bị REJECT.
+ * - Tuyệt đối không cho phép đơn hàng terminal (refunded, cancelled, expired, delivered) chuyển sang paid/wallet_paid.
  */
 export async function updateOrderStatus(
   db: DbOrTx,
   id: number,
   status: "paid" | "delivered" | "expired" | "underpaid" | "wallet_paid" | "refunded" | "cancelled",
-  paidAmount?: number
+  paidAmount?: number,
+  options?: UpdateOrderStatusOptions
 ): Promise<Order | null> {
+  // Guard 1: Generic updateOrderStatus cannot create settlement facts or mark orders paid without settlement context
+  if ((status === "paid" || status === "wallet_paid") && !options?.settlementContext) {
+    throw new Error(
+      `Financial settlement via generic updateOrderStatus('${status}') without settlement context is rejected. Use settleOrderPaidTx or settleOrderWalletPaidTx.`
+    );
+  }
+
+  // Guard 2: Terminal orders cannot reopen
+  const [existingOrder] = await db
+    .select({ status: orders.status })
+    .from(orders)
+    .where(eq(orders.id, id))
+    .limit(1);
+
+  if (existingOrder && TERMINAL_ORDER_STATUSES.includes(existingOrder.status)) {
+    if (status === "paid" || status === "wallet_paid") {
+      throw new Error(
+        `Cannot reopen terminal order #${id} from '${existingOrder.status}' to '${status}'`
+      );
+    }
+  }
+
   const now = new Date();
-  const patch: Partial<NewOrder> = { status };
+  const patch: Partial<NewOrder> = { status, updatedAt: now };
   if (paidAmount !== undefined) patch.paidAmount = paidAmount;
   if (status === "paid" || status === "wallet_paid") patch.paidAt = now;
 
@@ -342,10 +380,13 @@ export async function refundOrderWallet(
     await revokeDownloadTokensByOrder(tx, orderId);
 
     // 4. Calculate actual refund amount
+    // Phase 3C: settled_amount is canonical if available
     const bankReceived =
       lockedOrder.paidAmount ??
       (lockedOrder.status === "wallet_paid" ? 0 : lockedOrder.bankDue);
-    const refundAmount = (lockedOrder.walletPaid ?? 0) + (bankReceived ?? 0);
+    const refundAmount =
+      lockedOrder.settledAmount ??
+      ((lockedOrder.walletPaid ?? 0) + (bankReceived ?? 0));
 
     if (refundAmount <= 0) {
       throw new Error(`Số tiền hoàn lại không hợp lệ (${refundAmount}đ)`);

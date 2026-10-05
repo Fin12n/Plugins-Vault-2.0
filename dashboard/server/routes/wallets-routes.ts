@@ -147,8 +147,9 @@ export function registerWalletsRoutes(app: FastifyInstance) {
     }
   );
 
-  // Kiểm tra đối soát lệch số dư (Reconcile Drift)
+  // Kiểm tra đối soát đa tầng 7 chốt chặn (Multi-Layer Financial Reconciliation Check A -> G)
   app.get('/api/wallets/reconcile', async () => {
+    // Check A: Lệch số dư ví vs tổng sổ cái
     const driftRows = await db.execute<{
       discord_user_id: string;
       balance: number;
@@ -170,7 +171,86 @@ export function registerWalletsRoutes(app: FastifyInstance) {
       ledgerSum: Number(r.ledger_sum),
     }));
 
-    return { ok: true, drifts };
+    // Check B: Đơn đã tất toán thiếu settled_amount
+    const settledMissingAmount = await db.execute(sql`
+      SELECT id, status, amount, settled_amount
+      FROM orders
+      WHERE status IN ('paid', 'wallet_paid', 'delivered', 'refunded')
+        AND (settled_amount IS NULL OR settled_amount != amount)
+    `);
+
+    // Check C: Lệch giá trị giao hàng (NULL-safe IS DISTINCT FROM)
+    const deliveryMismatches = await db.execute(sql`
+      SELECT dl.id AS log_id, dl.order_id, dl.amount AS log_amount,
+             o.id AS matched_order_id, o.settled_amount, o.status AS order_status
+      FROM delivery_logs dl
+      LEFT JOIN orders o ON dl.order_id = o.id
+      WHERE o.id IS NULL
+         OR dl.amount IS DISTINCT FROM o.settled_amount
+    `);
+
+    // Check D: Đơn hoàn tiền thiếu bút toán order_refund hợp lệ
+    const refundsMissingLedger = await db.execute(sql`
+      SELECT o.id AS order_id, o.amount, o.status
+      FROM orders o
+      WHERE o.status = 'refunded'
+        AND NOT EXISTS (
+          SELECT 1 FROM wallet_ledger wl
+          WHERE wl.kind = 'order_refund'
+            AND wl.ref_type = 'order'
+            AND wl.ref_id = o.id
+            AND wl.delta > 0
+        )
+    `);
+
+    // Check E: Đối soát dòng tiền ngân hàng
+    const cashResult = await db.execute(sql`
+      SELECT
+        COALESCE(SUM(amount), 0) AS total_in,
+        COALESCE(SUM(CASE WHEN order_id IS NOT NULL OR topup_id IS NOT NULL THEN amount ELSE 0 END), 0) AS matched,
+        COALESCE(SUM(CASE WHEN order_id IS NULL AND topup_id IS NULL THEN amount ELSE 0 END), 0) AS unmatched
+      FROM sepay_transactions WHERE transfer_type = 'in'
+    `);
+    const cashRow = (cashResult.rows || [])[0] as Record<string, unknown> | undefined;
+    const totalCash = Number(cashRow?.["total_in"] ?? 0);
+    const matchedCash = Number(cashRow?.["matched"] ?? 0);
+    const unmatchedCash = Number(cashRow?.["unmatched"] ?? 0);
+    const cashUnbalanced = Math.abs(totalCash - matchedCash - unmatchedCash) > 0;
+
+    // Check F: Đơn wallet_paid thiếu settled_amount
+    const walletPaidNoSettled = await db.execute(sql`
+      SELECT id, amount FROM orders
+      WHERE status = 'wallet_paid' AND settled_amount IS NULL
+    `);
+
+    // Check G: Đơn terminal có dấu hiệu bị reopen hoặc can thiệp trái phép
+    const terminalAnomalies = await db.execute(sql`
+      SELECT id, status, settled_amount, paid_at
+      FROM orders
+      WHERE status IN ('cancelled', 'expired')
+        AND settled_amount IS NOT NULL
+    `);
+
+    return {
+      ok: true,
+      drifts,
+      checks: {
+        A_wallet_drift: drifts.length,
+        B_settled_missing_amount: (settledMissingAmount.rows || []).length,
+        C_delivery_mismatches: (deliveryMismatches.rows || []).length,
+        D_refund_no_ledger: (refundsMissingLedger.rows || []).length,
+        E_cash_unbalanced: cashUnbalanced ? 1 : 0,
+        F_wallet_paid_no_settled: (walletPaidNoSettled.rows || []).length,
+        G_terminal_anomalies: (terminalAnomalies.rows || []).length,
+      },
+      violations: {
+        settledMissingAmount: settledMissingAmount.rows || [],
+        deliveryMismatches: deliveryMismatches.rows || [],
+        refundsMissingLedger: refundsMissingLedger.rows || [],
+        walletPaidNoSettled: walletPaidNoSettled.rows || [],
+        terminalAnomalies: terminalAnomalies.rows || [],
+      },
+    };
   });
 
   // Danh sách nạp thẻ cào (Card Topups)

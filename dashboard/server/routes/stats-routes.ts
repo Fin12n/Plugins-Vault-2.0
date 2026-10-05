@@ -14,28 +14,39 @@ export function registerStatsRoutes(app: FastifyInstance) {
     const [paidCountRow] = await db
       .select({ val: count() })
       .from(orders)
-      .where(or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')));
+      .where(sql`${orders.settledAmount} IS NOT NULL`);
 
+    // Gross Settled Sales
     const [revRow] = await db
       .select({
-        total: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        total: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
-      .where(or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')));
+      .where(sql`${orders.settledAmount} IS NOT NULL`);
 
-    // Doanh thu hôm nay
+    // Contra-Revenue Refunds
+    const [refundRow] = await db
+      .select({
+        total: sql<number>`COALESCE(SUM(${walletLedger.delta}), 0)`,
+      })
+      .from(walletLedger)
+      .where(eq(walletLedger.kind, 'order_refund'));
+
+    const netTotalRevenue = Math.max(0, Number(revRow?.total ?? 0) - Math.abs(Number(refundRow?.total ?? 0)));
+
+    // Doanh thu hôm nay (lọc theo paid_at)
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
     const [todayRevRow] = await db
       .select({
-        total: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        total: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
       .where(
         and(
-          or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')),
-          gte(orders.createdAt, startOfToday)
+          sql`${orders.settledAmount} IS NOT NULL`,
+          gte(orders.paidAt, startOfToday)
         )
       );
 
@@ -61,15 +72,15 @@ export function registerStatsRoutes(app: FastifyInstance) {
       .orderBy(desc(orders.createdAt))
       .limit(5);
 
-    // Top plugins phổ biến nhất (5 plugins)
+    // Top plugins phổ biến nhất (5 plugins) theo settled_amount
     const popularRows = await db
       .select({
         pluginName: orders.pluginName,
         count: count(),
-        amount: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        amount: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
-      .where(or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')))
+      .where(sql`${orders.settledAmount} IS NOT NULL`)
       .groupBy(orders.pluginName)
       .orderBy(desc(count()))
       .limit(5);
@@ -79,7 +90,7 @@ export function registerStatsRoutes(app: FastifyInstance) {
       totalVersions: vCount?.val ?? 0,
       totalOrders: oCount?.val ?? 0,
       paidOrders: paidCountRow?.val ?? 0,
-      totalRevenue: Number(revRow?.total ?? 0),
+      totalRevenue: netTotalRevenue,
       todayRevenue: Number(todayRevRow?.total ?? 0),
       accountsHealthy: spigotHealthyRow?.val ?? 0,
       accountsTotal: spigotTotalRow?.val ?? 0,
@@ -95,7 +106,7 @@ export function registerStatsRoutes(app: FastifyInstance) {
     };
   });
 
-  // Báo cáo tháng
+  // Báo cáo tháng (theo orders.paid_at và settled_amount)
   app.get('/api/stats/monthly', async (request) => {
     const query = z.object({ month: z.string().optional() }).parse(request.query);
     const currentMonth = query.month || new Date().toISOString().slice(0, 7); // YYYY-MM
@@ -103,13 +114,13 @@ export function registerStatsRoutes(app: FastifyInstance) {
     const [sumRow] = await db
       .select({
         downloads: count(),
-        amount: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        amount: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
       .where(
         and(
-          or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')),
-          sql`to_char(${orders.createdAt}, 'YYYY-MM') = ${currentMonth}`
+          sql`${orders.settledAmount} IS NOT NULL`,
+          sql`to_char(${orders.paidAt}, 'YYYY-MM') = ${currentMonth}`
         )
       );
 
@@ -117,33 +128,33 @@ export function registerStatsRoutes(app: FastifyInstance) {
       .select({
         pluginName: orders.pluginName,
         downloads: count(),
-        amount: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        amount: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
       .where(
         and(
-          or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')),
-          sql`to_char(${orders.createdAt}, 'YYYY-MM') = ${currentMonth}`
+          sql`${orders.settledAmount} IS NOT NULL`,
+          sql`to_char(${orders.paidAt}, 'YYYY-MM') = ${currentMonth}`
         )
       )
       .groupBy(orders.pluginName)
-      .orderBy(desc(count()));
+      .orderBy(desc(sql`COALESCE(SUM(${orders.settledAmount}), 0)`), desc(count()));
 
     const userRows = await db
       .select({
         discordUserId: orders.discordUserId,
         downloads: count(),
-        amount: sql<number>`COALESCE(SUM(${orders.paidAmount}), 0)`,
+        amount: sql<number>`COALESCE(SUM(${orders.settledAmount}), 0)`,
       })
       .from(orders)
       .where(
         and(
-          or(eq(orders.status, 'paid'), eq(orders.status, 'delivered')),
-          sql`to_char(${orders.createdAt}, 'YYYY-MM') = ${currentMonth}`
+          sql`${orders.settledAmount} IS NOT NULL`,
+          sql`to_char(${orders.paidAt}, 'YYYY-MM') = ${currentMonth}`
         )
       )
       .groupBy(orders.discordUserId)
-      .orderBy(desc(count()));
+      .orderBy(desc(sql`COALESCE(SUM(${orders.settledAmount}), 0)`), desc(count()));
 
     return {
       month: currentMonth,
@@ -170,7 +181,14 @@ export function registerStatsRoutes(app: FastifyInstance) {
         totalDeposit: sql<number>`COALESCE(SUM(${walletLedger.delta}), 0)`,
       })
       .from(walletLedger)
-      .where(eq(walletLedger.kind, 'topup'))
+      .where(
+        or(
+          eq(walletLedger.kind, 'topup_credit'),
+          eq(walletLedger.kind, 'topup'),
+          eq(walletLedger.kind, 'card_credit'),
+          eq(walletLedger.kind, 'order_overpay_credit')
+        )
+      )
       .groupBy(walletLedger.discordUserId)
       .orderBy(desc(sql`SUM(${walletLedger.delta})`))
       .limit(20);
