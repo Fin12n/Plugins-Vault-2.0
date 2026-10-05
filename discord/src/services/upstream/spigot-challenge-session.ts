@@ -111,10 +111,14 @@ export class SpigotChallengeSessionManager {
         `({ width: window.innerWidth, height: window.innerHeight })` as never,
       ) as { width: number; height: number };
       const cdp = await current.session.page.createCDPSession();
-      const result = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 75, fromSurface: true }) as {
-        data: string;
-      };
-      return { image: Buffer.from(result.data, 'base64'), width: dimensions.width, height: dimensions.height };
+      try {
+        const result = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 75, fromSurface: true }) as {
+          data: string;
+        };
+        return { image: Buffer.from(result.data, 'base64'), width: dimensions.width, height: dimensions.height };
+      } finally {
+        await cdp.detach?.().catch(() => undefined);
+      }
     });
   }
 

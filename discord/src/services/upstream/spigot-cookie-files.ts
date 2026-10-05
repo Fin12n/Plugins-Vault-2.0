@@ -134,11 +134,14 @@ export async function extractAndSaveCookiesFromPage(
     if (typeof (page as any).createCDPSession === 'function') {
       try {
         const cdp = await (page as any).createCDPSession();
-        const res = await cdp.send('Network.getCookies');
-        if (Array.isArray(res?.cookies)) {
-          rawCookies = res.cookies as SpigotCookieItem[];
+        try {
+          const res = await cdp.send('Network.getCookies');
+          if (Array.isArray(res?.cookies)) {
+            rawCookies = res.cookies as SpigotCookieItem[];
+          }
+        } finally {
+          await cdp.detach().catch(() => {});
         }
-        await cdp.detach().catch(() => {});
       } catch {
         // Fallback to page.cookies
       }
@@ -184,23 +187,25 @@ export async function injectCookiesFromAccountFile(
   try {
     if (typeof (page as any).createCDPSession === 'function') {
       const cdp = await (page as any).createCDPSession();
-      await cdp.send('Network.enable');
+      try {
+        await cdp.send('Network.enable');
 
-      for (const c of loaded.cookies) {
-        if (!c.name || !c.value) continue;
-        await cdp.send('Network.setCookie', {
-          name: c.name,
-          value: c.value,
-          domain: c.domain ?? '.spigotmc.org',
-          path: c.path ?? '/',
-          secure: c.secure ?? true,
-          httpOnly: c.httpOnly ?? true,
-          sameSite: (c.sameSite as any) ?? 'None',
-        }).catch(() => {});
+        for (const c of loaded.cookies) {
+          if (!c.name || !c.value) continue;
+          await cdp.send('Network.setCookie', {
+            name: c.name,
+            value: c.value,
+            domain: c.domain ?? '.spigotmc.org',
+            path: c.path ?? '/',
+            secure: c.secure ?? true,
+            httpOnly: c.httpOnly ?? true,
+            sameSite: (c.sameSite as any) ?? 'None',
+          }).catch(() => {});
+        }
+        return true;
+      } finally {
+        await cdp.detach().catch(() => {});
       }
-
-      await cdp.detach().catch(() => {});
-      return true;
     }
 
     if (typeof (page as any).setCookie === 'function') {

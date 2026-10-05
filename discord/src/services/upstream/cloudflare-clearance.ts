@@ -165,23 +165,27 @@ export async function applyClearance(
   currentUserAgent: string,
 ): Promise<void> {
   const cdp = await page.createCDPSession();
-  await cdp.send('Network.enable');
-  if (solution.userAgent !== '' && solution.userAgent !== currentUserAgent) {
-    await cdp.send('Network.setUserAgentOverride', { userAgent: solution.userAgent });
-  }
-  for (const [name, value] of Object.entries(solution.cookies)) {
-    // Lọc theo danh sách trắng — xem INJECTABLE_COOKIES. Nhà cung cấp trả về cả cookie
-    // phiên của chính trình duyệt họ, và tiêm nguyên gói là đá account đang đăng nhập.
-    if (!INJECTABLE_COOKIES.has(name)) continue;
-    await cdp.send('Network.setCookie', {
-      name,
-      value,
-      domain,
-      path: '/',
-      secure: true,
-      httpOnly: true,
-      sameSite: 'None',
-    });
+  try {
+    await cdp.send('Network.enable');
+    if (solution.userAgent !== '' && solution.userAgent !== currentUserAgent) {
+      await cdp.send('Network.setUserAgentOverride', { userAgent: solution.userAgent });
+    }
+    for (const [name, value] of Object.entries(solution.cookies)) {
+      // Lọc theo danh sách trắng — xem INJECTABLE_COOKIES. Nhà cung cấp trả về cả cookie
+      // phiên của chính trình duyệt họ, và tiêm nguyên gói là đá account đang đăng nhập.
+      if (!INJECTABLE_COOKIES.has(name)) continue;
+      await cdp.send('Network.setCookie', {
+        name,
+        value,
+        domain,
+        path: '/',
+        secure: true,
+        httpOnly: true,
+        sameSite: 'None',
+      });
+    }
+  } finally {
+    await cdp.detach?.().catch(() => undefined);
   }
 }
 

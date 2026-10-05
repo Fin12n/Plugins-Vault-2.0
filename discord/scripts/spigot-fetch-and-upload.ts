@@ -41,7 +41,10 @@ type BrowserPage = {
   evaluate: (source: never) => Promise<unknown>;
   title: () => Promise<string>;
   url: () => string | Promise<string>;
-  createCDPSession: () => Promise<{ send: (method: string, params?: object) => Promise<unknown> }>;
+  createCDPSession: () => Promise<{
+    send: (method: string, params?: object) => Promise<unknown>;
+    detach?: () => Promise<void>;
+  }>;
   mouse: { click: (x: number, y: number) => Promise<void>; move: (x: number, y: number) => Promise<void> };
   keyboard: { type: (text: string, options?: object) => Promise<void> };
 };
@@ -177,52 +180,56 @@ async function download(page: BrowserPage, resourceId: number, dir: string): Pro
   mkdirSync(dir, { recursive: true });
 
   const cdp = await page.createCDPSession();
-  await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true });
+  try {
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true });
 
-  // Visit the resource page first: it establishes the session cookies the
-  // download endpoint checks, and clears the challenge once per resource.
-  await page.goto(`https://www.spigotmc.org/resources/${resourceId}/`, {
-    waitUntil: 'domcontentloaded',
-    timeout: CHALLENGE_TIMEOUT_MS,
-  });
-  for (let i = 0; i < 15; i++) {
-    await sleep(2500);
-    if (!/just a moment/i.test(await page.title())) break;
-  }
-
-  // A file download makes goto() reject; that rejection is success, not failure.
-  await page
-    .goto(`https://www.spigotmc.org/resources/${resourceId}/download`, {
+    // Visit the resource page first: it establishes the session cookies the
+    // download endpoint checks, and clears the challenge once per resource.
+    await page.goto(`https://www.spigotmc.org/resources/${resourceId}/`, {
       waitUntil: 'domcontentloaded',
-      timeout: 60_000,
-    })
-    .catch(() => undefined);
+      timeout: CHALLENGE_TIMEOUT_MS,
+    });
+    for (let i = 0; i < 15; i++) {
+      await sleep(2500);
+      if (!/just a moment/i.test(await page.title())) break;
+    }
 
-  const deadline = Date.now() + DOWNLOAD_WAIT_MS;
-  while (Date.now() < deadline) {
-    await sleep(2000);
-    const files = readdirSync(dir).filter((f) => !f.endsWith('.crdownload'));
-    if (files.length > 0) {
-      const path = join(dir, files[0]!);
-      if (statSync(path).size > 1024) {
-        // PK is the zip local file header. Rules out an HTML error page saved
-        // under a .jar name, which would surface much later as a broken plugin.
-        const magic = readFileSync(path).subarray(0, 2).toString();
-        if (magic !== 'PK') {
-          console.error(`  ✗ resource ${resourceId}: tải về không phải jar`);
-          return null;
+    // A file download makes goto() reject; that rejection is success, not failure.
+    await page
+      .goto(`https://www.spigotmc.org/resources/${resourceId}/download`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60_000,
+      })
+      .catch(() => undefined);
+
+    const deadline = Date.now() + DOWNLOAD_WAIT_MS;
+    while (Date.now() < deadline) {
+      await sleep(2000);
+      const files = readdirSync(dir).filter((f) => !f.endsWith('.crdownload'));
+      if (files.length > 0) {
+        const path = join(dir, files[0]!);
+        if (statSync(path).size > 1024) {
+          // PK is the zip local file header. Rules out an HTML error page saved
+          // under a .jar name, which would surface much later as a broken plugin.
+          const magic = readFileSync(path).subarray(0, 2).toString();
+          if (magic !== 'PK') {
+            console.error(`  ✗ resource ${resourceId}: tải về không phải jar`);
+            return null;
+          }
+          return path;
         }
-        return path;
       }
     }
-  }
 
-  const detail = await (page.evaluate(
-    `[...document.querySelectorAll('.errorPanel,.blockMessage,.error,.baseHtml')]
-       .map((e) => (e.textContent || '').trim()).filter(Boolean).slice(0, 1).join('').slice(0, 120)` as never,
-  ) as Promise<string>).catch(() => '');
-  console.error(`  ✗ resource ${resourceId}: ${detail || 'không tải được'}`);
-  return null;
+    const detail = await (page.evaluate(
+      `[...document.querySelectorAll('.errorPanel,.blockMessage,.error,.baseHtml')]
+         .map((e) => (e.textContent || '').trim()).filter(Boolean).slice(0, 1).join('').slice(0, 120)` as never,
+    ) as Promise<string>).catch(() => '');
+    console.error(`  ✗ resource ${resourceId}: ${detail || 'không tải được'}`);
+    return null;
+  } finally {
+    await cdp.detach?.().catch(() => undefined);
+  }
 }
 
 /** Logs into the vault dashboard and returns its session cookie. */

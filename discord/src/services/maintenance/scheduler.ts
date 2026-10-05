@@ -62,6 +62,7 @@ import {
   pruneOrphanProfiles,
   type LauncherProbe,
 } from '../upstream/browser-launcher.js';
+import { cloakSessionManager } from '../upstream/cloak-session-manager.js';
 import {
   extractAndSaveCookiesFromPage,
   injectCookiesFromAccountFile,
@@ -2242,6 +2243,52 @@ async function runBrowserSweep(
     const unusable = new Set<string>();
     const activationFailures = new Map<string, string>();
     let chromeClosedAbruptly = false;
+    let consecutiveCrashes = 0;
+    const MAX_CONSECUTIVE_CRASHES = 2;
+    let unsubscribeAbruptClose: (() => void) | null = null;
+
+    const detachCurrentSession = async () => {
+      if (unsubscribeAbruptClose) {
+        try { unsubscribeAbruptClose(); } catch { }
+        unsubscribeAbruptClose = null;
+      }
+      if (session) {
+        activeSessions.delete(workerId);
+        await session.close().catch(() => undefined);
+        session = null;
+        active = null;
+        activeProxyId = null;
+        activeSolver = null;
+        activeProxyDisplay = null;
+      }
+      await cloakSessionManager.releaseLock().catch(() => undefined);
+    };
+
+    const handleCrash = (reason: string) => {
+      consecutiveCrashes++;
+      sweepLogs.addForWorker(
+        workerId,
+        `🛑 Trình duyệt Chrome bị tắt đột ngột: ${reason} (lần ${consecutiveCrashes}/3)`,
+        consecutiveCrashes > MAX_CONSECUTIVE_CRASHES ? 'error' : 'warn',
+      );
+      if (consecutiveCrashes > MAX_CONSECUTIVE_CRASHES) {
+        chromeClosedAbruptly = true;
+        instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột (${consecutiveCrashes} lần) — dừng luồng!`);
+      }
+    };
+
+    const attachSessionAbruptClose = (s: BrowserSession) => {
+      if (unsubscribeAbruptClose) {
+        try { unsubscribeAbruptClose(); } catch { }
+        unsubscribeAbruptClose = null;
+      }
+      if (typeof s.onAbruptClose === 'function') {
+        const unsub = s.onAbruptClose((reason) => {
+          handleCrash(`abrupt close: ${reason}`);
+        });
+        unsubscribeAbruptClose = typeof unsub === 'function' ? unsub : null;
+      }
+    };
 
     const activate = async (label: string): Promise<boolean> => {
       if (chromeClosedAbruptly) return false;
@@ -2282,13 +2329,7 @@ async function runBrowserSweep(
       }
 
       if (session) {
-        activeSessions.delete(workerId);
-        await session.close().catch(() => undefined);
-        session = null;
-        active = null;
-        activeProxyId = null;
-        activeSolver = null;
-        activeProxyDisplay = null;
+        await detachCurrentSession();
       }
 
       // Nếu IP proxy đã hết hạn sống hoặc bị lỗi (dead), tự động forceRotate để chuyển sang IP mới
@@ -2325,23 +2366,25 @@ async function runBrowserSweep(
 
       if (savedXfUser || savedFromFile) {
         sweepLogs.addForWorker(workerId, `🍪 [${label}] Tìm thấy Cookie phiên đã lưu. Khởi tạo Chrome và tiêm Cookie...`, 'info');
+        let candidateSession: BrowserSession | null = null;
+        let adopted = false;
         try {
           const launched = await launchForAccount(probe, deps.env, label, deps.proxyPool, proxyEnabled, 1);
-          const cookieSession = launched.session;
+          candidateSession = launched.session;
           if (savedXfUser) {
-            await injectSpigotSessionCookies(cookieSession.page, { xfUser: savedXfUser, xfSession: savedXfSession ?? '' });
+            await injectSpigotSessionCookies(candidateSession.page, { xfUser: savedXfUser, xfSession: savedXfSession ?? '' });
           }
 
-          await cookieSession.page.goto('https://www.spigotmc.org/resources/purchased', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
-          const title = await cookieSession.page.title().catch(() => '');
+          await candidateSession.page.goto('https://www.spigotmc.org/resources/purchased', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+          const title = await candidateSession.page.title().catch(() => '');
           if (/just a moment|checking your browser/i.test(title)) {
             const waitMs = process.env.VITEST ? 50 : 3000 + Math.floor(Math.random() * 2000);
             sweepLogs.addForWorker(workerId, `🛡️ [${label}] Phát hiện Cloudflare Turnstile, dừng chờ từ từ ${(waitMs / 1000).toFixed(1)}s trước khi ấn...`, 'info');
             await new Promise((r) => setTimeout(r, waitMs));
-            await tryClickTurnstile(cookieSession.page, { skipWait: true });
+            await tryClickTurnstile(candidateSession.page, { skipWait: true });
             await new Promise((r) => setTimeout(r, process.env.VITEST ? 50 : 3000));
           }
-          const hasUser = await cookieSession.page.evaluate(
+          const hasUser = await candidateSession.page.evaluate(
             `(() => !!(document.querySelector('.accountUsername, a[href*="/members/"], a[href*="logout"]') || document.title.includes('Purchased')))` as never
           ).catch(() => false);
 
@@ -2349,20 +2392,14 @@ async function runBrowserSweep(
             sweepLogs.addForWorker(workerId, `⚡ [${label}] Cookie phiên sống! Kích hoạt thành công tức thì không cần điền mật khẩu!`, 'success');
             // Cập nhật lại cookie vào file ./data/cookie/{account}/*
             try {
-              const res = await extractAndSaveCookiesFromPage(cookieSession.page, label, { status: 'active', xfUser: savedXfUser, xfSession: savedXfSession });
+              const res = await extractAndSaveCookiesFromPage(candidateSession.page, label, { status: 'active', xfUser: savedXfUser, xfSession: savedXfSession });
               sweepLogs.addForWorker(workerId, `💾 [${label}] Đã cập nhật ${res.cookieCount} cookies sống vào ./data/cookie/${label}/*`, 'success');
             } catch { }
-            session = cookieSession;
+            session = candidateSession;
+            adopted = true;
+            candidateSession = null;
             activeSessions.set(workerId, session);
-            session.onAbruptClose?.((reason) => {
-              chromeClosedAbruptly = true;
-              sweepLogs.addForWorker(
-                workerId,
-                `🛑 Trình duyệt Chrome bị tắt đột ngột: ${reason} — Dừng luồng chạy #${workerId} ngay lập tức!`,
-                'error',
-              );
-              instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${reason}`);
-            });
+            attachSessionAbruptClose(session);
             activeProxyId = launched.endpoint?.id ?? null;
             activeEpoch = deps.proxyPool?.getRotationEpoch() ?? 0;
             activeSolver = solverFor?.(launched.endpoint) ?? null;
@@ -2381,10 +2418,14 @@ async function runBrowserSweep(
             return true;
           } else {
             sweepLogs.addForWorker(workerId, `⚠️ [${label}] Cookie đã hết hạn, chuyển sang đăng nhập tự động...`, 'info');
-            await cookieSession.close().catch(() => undefined);
           }
         } catch (cookieErr) {
           console.warn(`[Worker #${workerId}] Thử cookie phiên thất bại:`, cookieErr);
+        } finally {
+          if (!adopted && candidateSession) {
+            await candidateSession.close().catch(() => undefined);
+            candidateSession = null;
+          }
         }
       }
 
@@ -2406,14 +2447,13 @@ async function runBrowserSweep(
         );
       } catch (err) {
         if (isChromeClosedError(err)) {
-          chromeClosedAbruptly = true;
           const detail = err instanceof Error ? err.message : String(err);
-          sweepLogs.addForWorker(
-            workerId,
-            `🛑 Trình duyệt Chrome bị tắt đột ngột trong khi đăng nhập: ${detail} — Dừng luồng chạy #${workerId}!`,
-            'error',
-          );
-          instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${detail}`);
+          handleCrash(`đăng nhập: ${detail}`);
+          await detachCurrentSession();
+          if (consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES) {
+            const backoffMs = consecutiveCrashes === 1 ? (process.env.VITEST ? 20 : 1000) : (process.env.VITEST ? 50 : 3000);
+            await new Promise((r) => setTimeout(r, backoffMs));
+          }
           return false;
         }
         throw err;
@@ -2422,15 +2462,7 @@ async function runBrowserSweep(
       session = attempt.session;
       if (session) {
         activeSessions.set(workerId, session);
-        session.onAbruptClose?.((reason) => {
-          chromeClosedAbruptly = true;
-          sweepLogs.addForWorker(
-            workerId,
-            `🛑 Trình duyệt Chrome bị tắt đột ngột: ${reason} — Dừng luồng chạy #${workerId} ngay lập tức!`,
-            'error',
-          );
-          instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${reason}`);
-        });
+        attachSessionAbruptClose(session);
       }
       activeProxyId = attempt.proxyId;
       activeEpoch = deps.proxyPool?.getRotationEpoch() ?? 0;
@@ -2532,9 +2564,7 @@ async function runBrowserSweep(
         return false;
       }
       if (session) {
-        activeSessions.delete(workerId);
-        await session.close().catch(() => undefined);
-        session = null;
+        await detachCurrentSession();
       }
       return false;
     };
@@ -2599,174 +2629,185 @@ async function runBrowserSweep(
           resourceId: number,
           versionName: string,
         ): Promise<DownloadOutcome> => {
-          instanceTracker.heartbeat(workerId, `Chuẩn bị tải ${pluginName} v${versionName}...`);
-          if (chromeClosedAbruptly) {
-            return { status: 'error', detail: 'chrome_abruptly_closed: Chrome đã bị tắt đột ngột' };
-          }
+          let outcome: DownloadOutcome | null = null;
+          let fetchAttempts = 0;
 
-          // Kiểm tra nếu IP proxy đã chết (dead) hoặc hết hạn sống 1800s
-          if (deps.proxyPool?.isCurrentIpExpired()) {
-            sweepLogs.addForWorker(
-              workerId,
-              '⏱️ IP proxy đã hết hạn sống hoặc bị lỗi kết nối — bắt buộc đổi IP mới trước khi tải',
-              'info',
-            );
-            await deps.proxyPool.forceRotate({ maxInstancesPerProxy: 1 });
-          }
-
-          // Chế độ 1 Worker: Tăng tối đa độ ổn định (thời gian lâu => ổn định cao, làm việc từ tốn)
-          if (isSingleWorker && !process.env.VITEST && process.env.NODE_ENV !== 'test') {
-            sweepLogs.addForWorker(workerId, '🐢 [Chế độ 1 Worker] Nghỉ 3.5s giãn cách thao tác an toàn...', 'info');
-            instanceTracker.heartbeat(workerId, 'Đang nghỉ giãn cách thao tác...');
-            await new Promise((resolve) => setTimeout(resolve, 3500));
-          }
-
-          if (!(await activate(account.label)) || !session) {
-            const challenge = deps.challengeSessions?.getStatus();
-            if (challenge?.active) {
-              return {
-                status: 'challenged',
-                detail: challenge.reason ?? `Cloudflare chặn tài khoản ${account.label}`,
-              };
+          while (fetchAttempts < 3) {
+            fetchAttempts++;
+            instanceTracker.heartbeat(workerId, `Chuẩn bị tải ${pluginName} v${versionName}...`);
+            if (chromeClosedAbruptly) {
+              return { status: 'error', detail: 'chrome_abruptly_closed: Chrome đã bị tắt đột ngột' };
             }
-            return {
-              status: 'incomplete',
-              detail: activationFailures.get(account.label) ?? `không đăng nhập được ${account.label}`,
-            };
-          }
 
-          instanceTracker.updateWorker(workerId, {
-            status: 'downloading',
-            pluginName,
-            versionName,
-            taskStartedAt: Date.now(),
-            progressText: `Đang tải ${pluginName} v${versionName}...`,
-          });
-          sweepLogs.addForWorker(workerId, `Đang tải ${pluginName} v${versionName}...`, 'info');
-
-          const workerTab = session.page;
-          const outcome: DownloadOutcome = await downloadViaBrowser(
-            {
-              tmpDir: deps.env.TMP_DIR,
-              maxBytes: deps.env.UPLOAD_MAX_FILE_BYTES,
-              ...(activeProxyId === null ? { fetchImpl: fetch } : {}),
-              ...(activeSolver ? { solver: activeSolver } : {}),
-              log: (message) => {
-                const msg = message.trim();
-                const isErr =
-                  msg.includes('lỗi') ||
-                  msg.includes('thất bại') ||
-                  msg.includes('Error') ||
-                  msg.includes('hết thời gian');
-                const isOk = msg.includes('thành công') || msg.includes('xong') || msg.includes('OK');
-                instanceTracker.heartbeat(workerId, msg);
-                sweepLogs.addForWorker(workerId, msg, isErr ? 'error' : isOk ? 'success' : 'info');
-              },
-            },
-            workerTab,
-            resourceId,
-            versionName,
-          );
-
-          // Cập nhật thống kê worker
-          const currentWorker = instanceTracker.getAll().find((w) => w.id === workerId);
-          if (outcome.status === 'ok') {
-            instanceTracker.updateWorker(workerId, {
-              successCount: (currentWorker?.successCount ?? 0) + 1,
-              progressText: `Đã tải thành công ${pluginName} v${versionName}`,
-            });
-            sweepLogs.addForWorker(workerId, `Đã tải thành công ${pluginName} v${versionName}`, 'success');
-          } else if (outcome.status !== 'incomplete' && outcome.status !== 'not_owned') {
-            const detailText = 'detail' in outcome ? (outcome.detail ?? outcome.status) : outcome.status;
-            instanceTracker.updateWorker(workerId, {
-              failCount: (currentWorker?.failCount ?? 0) + 1,
-              progressText: `Tải thất bại (${detailText})`,
-            });
-            sweepLogs.addForWorker(workerId, `Tải thất bại (${detailText})`, 'error');
-          }
-
-          if (outcome.status === 'error') {
-            if (isChromeClosedError(outcome.detail)) {
-              chromeClosedAbruptly = true;
+            // Kiểm tra nếu IP proxy đã chết (dead) hoặc hết hạn sống 1800s
+            if (deps.proxyPool?.isCurrentIpExpired()) {
               sweepLogs.addForWorker(
                 workerId,
-                `🛑 Trình duyệt Chrome bị tắt đột ngột trong khi tải: ${outcome.detail} — Dừng luồng chạy #${workerId} ngay lập tức!`,
-                'error',
+                '⏱️ IP proxy đã hết hạn sống hoặc bị lỗi kết nối — bắt buộc đổi IP mới trước khi tải',
+                'info',
               );
-              instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${outcome.detail}`);
-              if (session) {
-                activeSessions.delete(workerId);
-                await session.close().catch(() => undefined);
-                session = null;
-              }
-              return { status: 'error', detail: outcome.detail };
+              await deps.proxyPool.forceRotate({ maxInstancesPerProxy: 1 });
             }
 
-            if (activeProxyId && isProxyFailure(new Error(outcome.detail ?? ''))) {
-              deps.proxyPool?.markBad(activeProxyId);
-              sweepLogs.addForWorker(workerId, `Proxy ${activeProxyId} bị lỗi — mở lại bằng IP khác`, 'warn');
-              activationFailures.set(account.label, 'proxy chết giữa lượt tải');
-              if (session) {
-                activeSessions.delete(workerId);
-                await session.close().catch(() => undefined);
-                session = null;
-                active = null;
-                activeProxyId = null;
-                activeSolver = null;
-                activeProxyDisplay = null;
-              }
-              return { status: 'incomplete', detail: 'proxy chết giữa lượt tải' };
+            // Chế độ 1 Worker: Tăng tối đa độ ổn định (thời gian lâu => ổn định cao, làm việc từ tốn)
+            if (isSingleWorker && !process.env.VITEST && process.env.NODE_ENV !== 'test') {
+              sweepLogs.addForWorker(workerId, '🐢 [Chế độ 1 Worker] Nghỉ 3.5s giãn cách thao tác an toàn...', 'info');
+              instanceTracker.heartbeat(workerId, 'Đang nghỉ giãn cách thao tác...');
+              await new Promise((resolve) => setTimeout(resolve, 3500));
             }
-          }
 
-          if (outcome.status === 'challenged' && session) {
-            if (activeProxyId) {
-              deps.proxyPool?.markBad(activeProxyId);
-              sweepLogs.addForWorker(workerId, `Proxy ${activeProxyId} bị Cloudflare chặn`, 'warn');
+            if (!(await activate(account.label)) || !session) {
+              const challenge = deps.challengeSessions?.getStatus();
+              if (challenge?.active) {
+                return {
+                  status: 'challenged',
+                  detail: challenge.reason ?? `Cloudflare chặn tài khoản ${account.label}`,
+                };
+              }
+              if (consecutiveCrashes > 0 && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && !chromeClosedAbruptly) {
+                continue;
+              }
+              return {
+                status: 'incomplete',
+                detail: activationFailures.get(account.label) ?? `không đăng nhập được ${account.label}`,
+              };
             }
-            activationFailures.set(account.label, outcome.detail);
-            unusable.add(account.label);
-            const credential = byLabel.get(account.label);
-            if (credential && deps.env.SPIGOT_INTERACTIVE_CHALLENGE && deps.challengeSessions) {
-              const heldSession = session;
-              const heldSolver = activeSolver;
-              activeSessions.delete(workerId);
-              await deps.challengeSessions.hold({
-                accountLabel: account.label,
-                credential,
-                reason: outcome.detail,
-                session: heldSession,
-                retryLogin: async () => {
-                  const retried = await loginToSpigot(heldSession.page, credential, {}, heldSolver ?? undefined);
-                  if (retried.ok) {
-                    deps.challengeCooldowns?.clear(account.label);
-                    try {
-                      const saved = await extractAndSaveCookiesFromPage(heldSession.page, account.label, { status: 'active' });
-                      if (saved.xfUser) {
-                        updateSpigotAccountSession(deps.db, account.label, {
-                          xfUser: saved.xfUser,
-                          xfSession: saved.xfSession ?? '',
-                          issuedAt: new Date().toISOString(),
-                          lastVerifiedAt: new Date().toISOString(),
-                          status: 'ok',
-                        });
-                      }
-                    } catch { }
-                  }
-                  return retried;
+
+            instanceTracker.updateWorker(workerId, {
+              status: 'downloading',
+              pluginName,
+              versionName,
+              taskStartedAt: Date.now(),
+              progressText: `Đang tải ${pluginName} v${versionName}...`,
+            });
+            sweepLogs.addForWorker(workerId, `Đang tải ${pluginName} v${versionName}...`, 'info');
+
+            const workerTab = session.page;
+            outcome = await downloadViaBrowser(
+              {
+                tmpDir: deps.env.TMP_DIR,
+                maxBytes: deps.env.UPLOAD_MAX_FILE_BYTES,
+                ...(activeProxyId === null ? { fetchImpl: fetch } : {}),
+                ...(activeSolver ? { solver: activeSolver } : {}),
+                log: (message) => {
+                  const msg = message.trim();
+                  const isErr =
+                    msg.includes('lỗi') ||
+                    msg.includes('thất bại') ||
+                    msg.includes('Error') ||
+                    msg.includes('hết thời gian');
+                  const isOk = msg.includes('thành công') || msg.includes('xong') || msg.includes('OK');
+                  instanceTracker.heartbeat(workerId, msg);
+                  sweepLogs.addForWorker(workerId, msg, isErr ? 'error' : isOk ? 'success' : 'info');
                 },
+              },
+              workerTab,
+              resourceId,
+              versionName,
+            );
+
+            // Cập nhật thống kê worker
+            const currentWorker = instanceTracker.getAll().find((w) => w.id === workerId);
+            if (outcome.status === 'ok') {
+              consecutiveCrashes = 0; // Reset crash counter after successful acquisition!
+              instanceTracker.updateWorker(workerId, {
+                successCount: (currentWorker?.successCount ?? 0) + 1,
+                progressText: `Đã tải thành công ${pluginName} v${versionName}`,
               });
-              session = null;
+              sweepLogs.addForWorker(workerId, `Đã tải thành công ${pluginName} v${versionName}`, 'success');
+              break;
+            } else if (outcome.status !== 'incomplete' && outcome.status !== 'not_owned') {
+              const detailText = 'detail' in outcome ? (outcome.detail ?? outcome.status) : outcome.status;
+              instanceTracker.updateWorker(workerId, {
+                failCount: (currentWorker?.failCount ?? 0) + 1,
+                progressText: `Tải thất bại (${detailText})`,
+              });
+              sweepLogs.addForWorker(workerId, `Tải thất bại (${detailText})`, 'error');
+            }
+
+            if (outcome.status === 'error') {
+              if (isChromeClosedError(outcome.detail)) {
+                handleCrash(outcome.detail ?? 'Chrome crash');
+                await detachCurrentSession();
+                if (consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES) {
+                  const backoffMs = consecutiveCrashes === 1
+                    ? (process.env.VITEST ? 20 : 1000)
+                    : (process.env.VITEST ? 50 : 3000);
+                  sweepLogs.addForWorker(
+                    workerId,
+                    `🔄 Chrome bị tắt đột ngột (lần ${consecutiveCrashes}/${MAX_CONSECUTIVE_CRASHES}). Đang tự động khởi động lại sau ${backoffMs}ms...`,
+                    'warn',
+                  );
+                  instanceTracker.heartbeat(workerId, `Đang khởi động lại sau crash (${consecutiveCrashes}/${MAX_CONSECUTIVE_CRASHES})...`);
+                  await new Promise((r) => setTimeout(r, backoffMs));
+                  chromeClosedAbruptly = false;
+                  continue;
+                }
+                return { status: 'error', detail: outcome.detail };
+              }
+
+              if (activeProxyId && isProxyFailure(new Error(outcome.detail ?? ''))) {
+                deps.proxyPool?.markBad(activeProxyId);
+                sweepLogs.addForWorker(workerId, `Proxy ${activeProxyId} bị lỗi — mở lại bằng IP khác`, 'warn');
+                activationFailures.set(account.label, 'proxy chết giữa lượt tải');
+                await detachCurrentSession();
+                return { status: 'incomplete', detail: 'proxy chết giữa lượt tải' };
+              }
+            }
+
+            if (outcome.status === 'challenged' && session) {
+              if (activeProxyId) {
+                deps.proxyPool?.markBad(activeProxyId);
+                sweepLogs.addForWorker(workerId, `Proxy ${activeProxyId} bị Cloudflare chặn`, 'warn');
+              }
+              activationFailures.set(account.label, outcome.detail);
+              unusable.add(account.label);
+              const credential = byLabel.get(account.label);
+              if (credential && deps.env.SPIGOT_INTERACTIVE_CHALLENGE && deps.challengeSessions) {
+                const heldSession = session;
+                const heldSolver = activeSolver;
+                activeSessions.delete(workerId);
+                if (unsubscribeAbruptClose) {
+                  try { unsubscribeAbruptClose(); } catch { }
+                  unsubscribeAbruptClose = null;
+                }
+                session = null;
+                await deps.challengeSessions.hold({
+                  accountLabel: account.label,
+                  credential,
+                  reason: outcome.detail,
+                  session: heldSession,
+                  retryLogin: async () => {
+                    const retried = await loginToSpigot(heldSession.page, credential, {}, heldSolver ?? undefined);
+                    if (retried.ok) {
+                      deps.challengeCooldowns?.clear(account.label);
+                      try {
+                        const saved = await extractAndSaveCookiesFromPage(heldSession.page, account.label, { status: 'active' });
+                        if (saved.xfUser) {
+                          updateSpigotAccountSession(deps.db, account.label, {
+                            xfUser: saved.xfUser,
+                            xfSession: saved.xfSession ?? '',
+                            issuedAt: new Date().toISOString(),
+                            lastVerifiedAt: new Date().toISOString(),
+                            status: 'ok',
+                          });
+                        }
+                      } catch { }
+                    }
+                    return retried;
+                  },
+                });
+                return outcome;
+              }
+              await detachCurrentSession();
               return outcome;
             }
-            activeSessions.delete(workerId);
-            await session.close().catch(() => undefined);
-            session = null;
-            active = null;
-            activeProxyId = null;
-            activeSolver = null;
-            activeProxyDisplay = null;
-            return outcome;
+
+            break;
+          }
+
+          if (!outcome) {
+            return { status: 'error', detail: 'Quá trình tải thất bại sau nhiều lần thử' };
           }
 
           // Trong chế độ 1 Worker: Cho phép nghỉ 2s để file xả xuống đĩa và session ổn định
@@ -2782,8 +2823,24 @@ async function runBrowserSweep(
         for (const out of sweep.outcomes) allOutcomes.push(out);
         for (const id of sweep.handledPluginIds) allHandledPluginIds.add(id);
 
-        if (chromeClosedAbruptly || sweep.sweep.abortReason === 'chrome_closed') {
-          chromeClosedAbruptly = true;
+        if (sweep.sweep.abortReason === 'chrome_closed') {
+          handleCrash('chrome_closed during sweep');
+          await detachCurrentSession();
+          if (consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES) {
+            const backoffMs = consecutiveCrashes === 1 ? (process.env.VITEST ? 20 : 1000) : (process.env.VITEST ? 50 : 3000);
+            sweepLogs.addForWorker(workerId, `🔄 Khởi động lại luồng #${workerId} sau sự cố Chrome (lần ${consecutiveCrashes}/${MAX_CONSECUTIVE_CRASHES})...`, 'info');
+            await new Promise((r) => setTimeout(r, backoffMs));
+            chromeClosedAbruptly = false;
+            continue;
+          } else {
+            chromeClosedAbruptly = true;
+            sweepLogs.addForWorker(workerId, `🛑 Đã dừng hoàn toàn luồng #${workerId} do Chrome bị tắt đột ngột.`, 'warn');
+            instanceTracker.stopWorker(workerId, 'Chrome bị tắt đột ngột — đã dừng luồng!');
+            break;
+          }
+        }
+
+        if (chromeClosedAbruptly) {
           sweepLogs.addForWorker(workerId, `🛑 Đã dừng hoàn toàn luồng #${workerId} do Chrome bị tắt đột ngột.`, 'warn');
           instanceTracker.stopWorker(workerId, 'Chrome bị tắt đột ngột — đã dừng luồng!');
           break;
@@ -2791,10 +2848,14 @@ async function runBrowserSweep(
       }
     } catch (err) {
       if (isChromeClosedError(err)) {
-        chromeClosedAbruptly = true;
         const errMsg = err instanceof Error ? err.message : String(err);
-        sweepLogs.addForWorker(workerId, `🛑 Trình duyệt Chrome bị tắt đột ngột: ${errMsg} — Dừng luồng #${workerId}!`, 'error');
-        instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${errMsg}`);
+        handleCrash(`tiến trình worker: ${errMsg}`);
+        await detachCurrentSession();
+        if (consecutiveCrashes > MAX_CONSECUTIVE_CRASHES) {
+          chromeClosedAbruptly = true;
+          sweepLogs.addForWorker(workerId, `🛑 Trình duyệt Chrome bị tắt đột ngột: ${errMsg} — Dừng luồng #${workerId}!`, 'error');
+          instanceTracker.stopWorker(workerId, `Chrome bị tắt đột ngột: ${errMsg}`);
+        }
       } else {
         console.error(`[Worker #${workerId}] Lỗi tiến trình worker:`, err);
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -2806,10 +2867,7 @@ async function runBrowserSweep(
         sweepLogs.addForWorker(workerId, `Lỗi tiến trình worker: ${errMsg}`, 'error');
       }
     } finally {
-      if (session) {
-        activeSessions.delete(workerId);
-        await (session as BrowserSession).close().catch(() => undefined);
-      }
+      await detachCurrentSession();
       if (!chromeClosedAbruptly) {
         instanceTracker.releaseWorker(workerId);
       }

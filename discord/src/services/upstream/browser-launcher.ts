@@ -326,12 +326,15 @@ export async function probeBrowserLauncher(
     const pages = await browser.pages();
     const page = (pages.length > 0 ? pages[0] : await browser.newPage()) as BrowserSession['page'];
     tracker.attachBrowser(browser, page);
+    tracker.onAbruptClose(() => {
+      lockHandle.markDead();
+    });
 
     if (options.proxyServer && options.proxyUsername && options.proxyPassword && page.authenticate) {
       try {
         await page.authenticate({ username: options.proxyUsername, password: options.proxyPassword });
       } catch (err) {
-        tracker.markGraceful();
+        tracker.dispose();
         await closeBrowser(browser).catch(() => undefined);
         await lockHandle.release();
         if (isEphemeral && dir && existsSync(dir)) {
@@ -358,7 +361,7 @@ export async function probeBrowserLauncher(
     return {
       page,
       close: async () => {
-        tracker.markGraceful();
+        tracker.dispose();
         await closeBrowser(browser).catch(() => undefined);
         await lockHandle.release();
         // Xóa sạch thư mục session tạm thời -> Dữ liệu hoàn toàn đi vào hư vô!

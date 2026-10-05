@@ -30,7 +30,10 @@ export type BrowserPage = {
   goto: (url: string, options?: object) => Promise<unknown>;
   evaluate: (source: never) => Promise<unknown>;
   title: () => Promise<string>;
-  createCDPSession: () => Promise<{ send: (method: string, params?: object) => Promise<unknown> }>;
+  createCDPSession: () => Promise<{
+    send: (method: string, params?: object) => Promise<unknown>;
+    detach?: () => Promise<void>;
+  }>;
   mouse: { click: (x: number, y: number) => Promise<void>; move: (x: number, y: number) => Promise<void> };
   keyboard: { type: (text: string, options?: object) => Promise<void>; press: (key: string) => Promise<void> };
   authenticate?: (credentials: { username: string; password: string }) => Promise<void>;
@@ -40,7 +43,7 @@ export type BrowserSession = {
   page: BrowserPage;
   close: () => Promise<void>;
   isAbruptlyClosed?: () => boolean;
-  onAbruptClose?: (callback: (reason: string) => void) => void;
+  onAbruptClose?: (callback: (reason: string) => void) => (() => void);
   markAbruptlyClosed?: (reason?: string) => void;
 };
 
@@ -205,30 +208,34 @@ export async function injectSpigotSessionCookies(
   if (!cookies.xfUser && !cookies.xfSession) return false;
   try {
     const cdp = await page.createCDPSession();
-    await cdp.send('Network.enable');
-    if (cookies.xfUser) {
-      await cdp.send('Network.setCookie', {
-        name: 'xf_user',
-        value: cookies.xfUser,
-        domain,
-        path: '/',
-        secure: true,
-        httpOnly: true,
-        sameSite: 'None',
-      });
+    try {
+      await cdp.send('Network.enable');
+      if (cookies.xfUser) {
+        await cdp.send('Network.setCookie', {
+          name: 'xf_user',
+          value: cookies.xfUser,
+          domain,
+          path: '/',
+          secure: true,
+          httpOnly: true,
+          sameSite: 'None',
+        });
+      }
+      if (cookies.xfSession) {
+        await cdp.send('Network.setCookie', {
+          name: 'xf_session',
+          value: cookies.xfSession,
+          domain,
+          path: '/',
+          secure: true,
+          httpOnly: true,
+          sameSite: 'None',
+        });
+      }
+      return true;
+    } finally {
+      await cdp.detach?.().catch(() => undefined);
     }
-    if (cookies.xfSession) {
-      await cdp.send('Network.setCookie', {
-        name: 'xf_session',
-        value: cookies.xfSession,
-        domain,
-        path: '/',
-        secure: true,
-        httpOnly: true,
-        sameSite: 'None',
-      });
-    }
-    return true;
   } catch {
     if (typeof (page as any).setCookie === 'function') {
       const list = [];
@@ -1031,161 +1038,165 @@ export async function downloadViaBrowser(
     // Cách 2: Tải dự phòng bằng CDP + goto
     log(`resource ${resourceId}: thử tải qua CDP + goto (dự phòng)…`);
     const cdp = await page.createCDPSession();
-    let cdpDownloadOk = false;
     try {
-      await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir });
-      cdpDownloadOk = true;
-    } catch (e) {
-      log(`resource ${resourceId}: Page.setDownloadBehavior thất bại: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    try {
-      await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true });
-      cdpDownloadOk = true;
-    } catch (e) {
-      log(`resource ${resourceId}: Browser.setDownloadBehavior thất bại: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    if (!cdpDownloadOk) {
-      log(`resource ${resourceId}: CẢNH BÁO — không set được download path qua CDP`);
-    }
-
-    const openDownload = (): Promise<unknown> =>
-      page.goto(downloadUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
-    if (deps.solver) await deps.solver.prime(page, downloadUrl).catch(() => false);
-    await openDownload();
-
-    let landedTitle = await page.title().catch(() => '');
-    if (/just a moment|checking your browser|attention required|cloudflare/i.test(landedTitle)) {
-      if (deps.solver) {
-        const solved = await deps.solver.solve(page, `https://www.spigotmc.org/resources/${resourceId}/`);
-        if (solved.ok) {
-          log(
-            `resource ${resourceId}: ${solved.reused ? 'dùng lại cf_clearance' : 'đã mua cf_clearance'} — tải lại`,
-          );
-          try { await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir }); } catch { }
-          try { await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true }); } catch { }
-          await openDownload();
-          landedTitle = await page.title().catch(() => '');
-        } else {
-          log(`resource ${resourceId}: YesCaptcha không giải được: ${solved.detail}`);
-          return { status: 'challenged', detail: `Cloudflare chặn khi tải (${solved.detail})` };
-        }
-      } else {
-        log(`resource ${resourceId}: Cloudflare chặn endpoint tải (chưa cấu hình YesCaptcha)`);
-        return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
-      }
-    }
-
-    const early = await readPageMessage(page);
-    const landedUnowned = await (page.evaluate(`(() => {
-      const text = document.body ? document.body.innerText || '' : '';
-      if (/do not have permission|not have access|must purchase|buy this/i.test(text)) return 'not_owned';
-      if (/must be logged in|log in to/i.test(text)) return 'cookie_dead';
-      const buy = document.querySelector('a[href*="/purchase"], a[href*="/buy"], .price');
-      const dl = document.querySelector('a[href*="/download"], label.downloadButton');
-      if (buy && !dl) return 'not_owned';
-      return null;
-    })()` as never) as Promise<string | null>).catch(() => null);
-
-    if (landedUnowned === 'not_owned' || /do not have permission|not have access|must purchase|buy this/i.test(early)) {
-      log(`resource ${resourceId}: trang nói không có quyền tải`);
-      return { status: 'not_owned' };
-    }
-    if (landedUnowned === 'cookie_dead' || /must be logged in|log in to/i.test(early)) {
-      log(`resource ${resourceId}: trang nói chưa đăng nhập`);
-      return { status: 'cookie_dead' };
-    }
-
-    const START_TIMEOUT_MS = 25_000;
-    const deadline = Date.now() + DOWNLOAD_WAIT_MS;
-    const startDeadline = Date.now() + START_TIMEOUT_MS;
-    let lastReport = 0;
-    let downloadStarted = false;
-
-    while (Date.now() < deadline) {
-      if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
-      await sleep(2_000);
-
+      let cdpDownloadOk = false;
       try {
-        await page.title();
-      } catch (err) {
-        if (isChromeClosedError(err)) {
-          log(`resource ${resourceId}: Chrome đã bị đóng trong lúc chờ tải`);
-          return {
-            status: 'error',
-            detail: `chrome_abruptly_closed: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
+        await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir });
+        cdpDownloadOk = true;
+      } catch (e) {
+        log(`resource ${resourceId}: Page.setDownloadBehavior thất bại: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      try {
+        await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true });
+        cdpDownloadOk = true;
+      } catch (e) {
+        log(`resource ${resourceId}: Browser.setDownloadBehavior thất bại: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (!cdpDownloadOk) {
+        log(`resource ${resourceId}: CẢNH BÁO — không set được download path qua CDP`);
       }
 
-      const partial = await readdir(dir);
-      let bytes = 0;
-      for (const file of partial) {
-        bytes += await stat(join(dir, file)).then(
-          (s) => s.size,
-          () => 0,
-        );
-      }
+      const openDownload = (): Promise<unknown> =>
+        page.goto(downloadUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
+      if (deps.solver) await deps.solver.prime(page, downloadUrl).catch(() => false);
+      await openDownload();
 
-      if (partial.length > 0 || bytes > 0) {
-        downloadStarted = true;
-      }
-
-      if (Date.now() - lastReport > 10_000) {
-        lastReport = Date.now();
-        log(`resource ${resourceId}: đang tải… ${partial.length} tệp, ${(bytes / 1048576).toFixed(1)} MB`);
-      }
-
-      if (!downloadStarted && Date.now() > startDeadline) {
-        const title = await page.title().catch(() => '');
-        const currentMsg = await readPageMessage(page);
-        log(`resource ${resourceId}: không có tệp nào tải về sau 25s — tiêu đề "${title}", trang: ${currentMsg.slice(0, 100)}`);
-
-        if (/just a moment|checking your browser|attention required|cloudflare/i.test(title)) {
+      let landedTitle = await page.title().catch(() => '');
+      if (/just a moment|checking your browser|attention required|cloudflare/i.test(landedTitle)) {
+        if (deps.solver) {
+          const solved = await deps.solver.solve(page, `https://www.spigotmc.org/resources/${resourceId}/`);
+          if (solved.ok) {
+            log(
+              `resource ${resourceId}: ${solved.reused ? 'dùng lại cf_clearance' : 'đã mua cf_clearance'} — tải lại`,
+            );
+            try { await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir }); } catch { }
+            try { await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true }); } catch { }
+            await openDownload();
+            landedTitle = await page.title().catch(() => '');
+          } else {
+            log(`resource ${resourceId}: YesCaptcha không giải được: ${solved.detail}`);
+            return { status: 'challenged', detail: `Cloudflare chặn khi tải (${solved.detail})` };
+          }
+        } else {
+          log(`resource ${resourceId}: Cloudflare chặn endpoint tải (chưa cấu hình YesCaptcha)`);
           return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
         }
-        if (/do not have permission to view this page|not have permission to perform this action|not be found|no longer available|deleted/i.test(currentMsg) || /do not have permission/i.test(title)) {
-          return { status: 'gone', detail: 'plugin đã bị xoá trên Spigot' };
+      }
+
+      const early = await readPageMessage(page);
+      const landedUnowned = await (page.evaluate(`(() => {
+        const text = document.body ? document.body.innerText || '' : '';
+        if (/do not have permission|not have access|must purchase|buy this/i.test(text)) return 'not_owned';
+        if (/must be logged in|log in to/i.test(text)) return 'cookie_dead';
+        const buy = document.querySelector('a[href*="/purchase"], a[href*="/buy"], .price');
+        const dl = document.querySelector('a[href*="/download"], label.downloadButton');
+        if (buy && !dl) return 'not_owned';
+        return null;
+      })()` as never) as Promise<string | null>).catch(() => null);
+
+      if (landedUnowned === 'not_owned' || /do not have permission|not have access|must purchase|buy this/i.test(early)) {
+        log(`resource ${resourceId}: trang nói không có quyền tải`);
+        return { status: 'not_owned' };
+      }
+      if (landedUnowned === 'cookie_dead' || /must be logged in|log in to/i.test(early)) {
+        log(`resource ${resourceId}: trang nói chưa đăng nhập`);
+        return { status: 'cookie_dead' };
+      }
+
+      const START_TIMEOUT_MS = 25_000;
+      const deadline = Date.now() + DOWNLOAD_WAIT_MS;
+      const startDeadline = Date.now() + START_TIMEOUT_MS;
+      let lastReport = 0;
+      let downloadStarted = false;
+
+      while (Date.now() < deadline) {
+        if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
+        await sleep(2_000);
+
+        try {
+          await page.title();
+        } catch (err) {
+          if (isChromeClosedError(err)) {
+            log(`resource ${resourceId}: Chrome đã bị đóng trong lúc chờ tải`);
+            return {
+              status: 'error',
+              detail: `chrome_abruptly_closed: ${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
         }
-        if (/do not have permission|not have access|must purchase|buy this/i.test(currentMsg) || /error\s*\|/i.test(title)) {
-          return { status: 'not_owned' };
+
+        const partial = await readdir(dir);
+        let bytes = 0;
+        for (const file of partial) {
+          bytes += await stat(join(dir, file)).then(
+            (s) => s.size,
+            () => 0,
+          );
         }
-        return { status: 'incomplete', detail: `trình duyệt không nhận được tệp sau 25s (tiêu đề: "${title}")` };
+
+        if (partial.length > 0 || bytes > 0) {
+          downloadStarted = true;
+        }
+
+        if (Date.now() - lastReport > 10_000) {
+          lastReport = Date.now();
+          log(`resource ${resourceId}: đang tải… ${partial.length} tệp, ${(bytes / 1048576).toFixed(1)} MB`);
+        }
+
+        if (!downloadStarted && Date.now() > startDeadline) {
+          const title = await page.title().catch(() => '');
+          const currentMsg = await readPageMessage(page);
+          log(`resource ${resourceId}: không có tệp nào tải về sau 25s — tiêu đề "${title}", trang: ${currentMsg.slice(0, 100)}`);
+
+          if (/just a moment|checking your browser|attention required|cloudflare/i.test(title)) {
+            return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
+          }
+          if (/do not have permission to view this page|not have permission to perform this action|not be found|no longer available|deleted/i.test(currentMsg) || /do not have permission/i.test(title)) {
+            return { status: 'gone', detail: 'plugin đã bị xoá trên Spigot' };
+          }
+          if (/do not have permission|not have access|must purchase|buy this/i.test(currentMsg) || /error\s*\|/i.test(title)) {
+            return { status: 'not_owned' };
+          }
+          return { status: 'incomplete', detail: `trình duyệt không nhận được tệp sau 25s (tiêu đề: "${title}")` };
+        }
+
+        const files = (await readdir(dir)).filter((f) => !f.endsWith('.crdownload'));
+        if (files.length === 0) continue;
+
+        const path = join(dir, files[0]!);
+        const size = (await stat(path)).size;
+        if (size < MIN_PLAUSIBLE_BYTES) continue;
+        if (size > deps.maxBytes) {
+          return { status: 'error', detail: `tệp ${size} byte vượt giới hạn ${deps.maxBytes}` };
+        }
+
+        const head = await readHead(path, 200);
+        if (head.subarray(0, 2).toString() !== 'PK') {
+          const text = head.toString('utf8').replace(/\s+/g, ' ');
+          log(`resource ${resourceId}: tệp không phải jar (${size} byte) — đầu tệp: ${text.slice(0, 120)}`);
+          return { status: 'incomplete', detail: `tải về không phải jar (${size} byte)` };
+        }
+
+        const finalPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar`);
+        await rename(path, finalPath);
+        log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB — ${files[0]}`);
+        return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
       }
 
-      const files = (await readdir(dir)).filter((f) => !f.endsWith('.crdownload'));
-      if (files.length === 0) continue;
+      const message = await readPageMessage(page);
+      const title = await page.title().catch(() => '');
+      log(`resource ${resourceId}: hết thời gian chờ — tiêu đề "${title}", trang nói: ${message.slice(0, 120)}`);
 
-      const path = join(dir, files[0]!);
-      const size = (await stat(path)).size;
-      if (size < MIN_PLAUSIBLE_BYTES) continue;
-      if (size > deps.maxBytes) {
-        return { status: 'error', detail: `tệp ${size} byte vượt giới hạn ${deps.maxBytes}` };
+      if (/just a moment|checking your browser/i.test(title)) {
+        return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
       }
-
-      const head = await readHead(path, 200);
-      if (head.subarray(0, 2).toString() !== 'PK') {
-        const text = head.toString('utf8').replace(/\s+/g, ' ');
-        log(`resource ${resourceId}: tệp không phải jar (${size} byte) — đầu tệp: ${text.slice(0, 120)}`);
-        return { status: 'incomplete', detail: `tải về không phải jar (${size} byte)` };
-      }
-
-      const finalPath = join(deps.tmpDir, `spigot-${randomUUID()}.jar`);
-      await rename(path, finalPath);
-      log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB — ${files[0]}`);
-      return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
+      if (/must be logged in|log in to/i.test(message)) return { status: 'cookie_dead' };
+      if (/do not have permission|not have access|purchase/i.test(message)) return { status: 'not_owned' };
+      if (/not be found|no longer available|deleted/i.test(message)) return { status: 'gone' };
+      return { status: 'error', detail: message || 'không tải được, không rõ lý do' };
+    } finally {
+      await cdp.detach?.().catch(() => undefined);
     }
-
-    const message = await readPageMessage(page);
-    const title = await page.title().catch(() => '');
-    log(`resource ${resourceId}: hết thời gian chờ — tiêu đề "${title}", trang nói: ${message.slice(0, 120)}`);
-
-    if (/just a moment|checking your browser/i.test(title)) {
-      return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
-    }
-    if (/must be logged in|log in to/i.test(message)) return { status: 'cookie_dead' };
-    if (/do not have permission|not have access|purchase/i.test(message)) return { status: 'not_owned' };
-    if (/not be found|no longer available|deleted/i.test(message)) return { status: 'gone' };
-    return { status: 'error', detail: message || 'không tải được, không rõ lý do' };
   } catch (err) {
     if (isChromeClosedError(err)) {
       return {

@@ -20,9 +20,11 @@ export type ActiveSessionInfo = {
   startedAt: number;
   browser: {
     close: () => Promise<void>;
-    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean } | null;
+    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean; pid?: number; killed?: boolean } | null;
+    isConnected?: () => boolean;
   } | null;
   tempProfileDir?: string;
+  isDead?: boolean;
 };
 
 export type SessionLockHandle = {
@@ -30,6 +32,7 @@ export type SessionLockHandle = {
   startedAt: number;
   registerBrowser: (browser: ActiveSessionInfo['browser']) => void;
   release: () => Promise<void>;
+  markDead: () => void;
 };
 
 /**
@@ -51,6 +54,50 @@ class CloakSessionManager {
    */
   public getActiveSessionInfo(): Readonly<ActiveSessionInfo> | null {
     return this.activeSession ? { ...this.activeSession } : null;
+  }
+
+  /**
+   * Kiểm tra xem session hiện tại có bị crash hoặc ngắt kết nối hay không.
+   */
+  public isSessionDead(session: ActiveSessionInfo | null = this.activeSession): boolean {
+    if (!session) return false;
+    if (session.isDead) return true;
+
+    if (session.browser) {
+      if (typeof session.browser.isConnected === 'function' && !session.browser.isConnected()) {
+        return true;
+      }
+      try {
+        const proc = session.browser.process?.();
+        if (proc) {
+          if (proc.killed) return true;
+          const pid = proc.pid;
+          if (typeof pid === 'number') {
+            try {
+              process.kill(pid, 0);
+            } catch (err: unknown) {
+              const code = (err as { code?: string })?.code;
+              if (code === 'ESRCH') {
+                return true;
+              }
+            }
+          }
+        }
+      } catch {
+        // Bỏ qua lỗi
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Đánh dấu session hiện tại là đã chết (crash).
+   */
+  public markActiveSessionDead(): void {
+    if (this.activeSession) {
+      this.activeSession.isDead = true;
+    }
   }
 
   /**
@@ -80,11 +127,20 @@ class CloakSessionManager {
 
   /**
    * Yêu cầu cấp phát khóa độc quyền (Mutex Lock) để mở session CloakBrowser mới.
-   * Nếu đã có session đang chạy, ném lỗi SessionConflictError ngay lập tức.
+   * Nếu đã có session đang chạy:
+   *  - Nếu session cũ đã chết (crashed/disconnected), tự động dọn dẹp và cấp lock mới.
+   *  - Nếu session cũ còn sống, ném lỗi SessionConflictError ngay lập tức.
    */
   public async acquireLock(taskName: string, tempProfileDir?: string): Promise<SessionLockHandle> {
     if (this.activeSession !== null) {
-      throw new SessionConflictError(this.activeSession.taskName, taskName);
+      if (this.isSessionDead(this.activeSession)) {
+        console.warn(
+          `[CloakSessionManager] Phát hiện phiên CloakBrowser cũ cho tác vụ "${this.activeSession.taskName}" đã chết (crashed/disconnected). Tự động dọn dẹp để cấp lock mới cho "${taskName}".`
+        );
+        await this.releaseLock();
+      } else {
+        throw new SessionConflictError(this.activeSession.taskName, taskName);
+      }
     }
 
     const sessionInfo: ActiveSessionInfo = {
@@ -102,6 +158,33 @@ class CloakSessionManager {
       registerBrowser: (browser: ActiveSessionInfo['browser']) => {
         if (this.activeSession && this.activeSession.taskName === taskName) {
           this.activeSession.browser = browser;
+
+          const bAny = browser as unknown as { on?: (event: string, cb: () => void) => void };
+          if (bAny && typeof bAny.on === 'function') {
+            bAny.on('disconnected', () => {
+              if (this.activeSession && this.activeSession.browser === browser) {
+                this.activeSession.isDead = true;
+              }
+            });
+          }
+
+          try {
+            const proc = browser?.process?.() as unknown as { on?: (event: string, cb: () => void) => void } | null;
+            if (proc && typeof proc.on === 'function') {
+              proc.on('exit', () => {
+                if (this.activeSession && this.activeSession.browser === browser) {
+                  this.activeSession.isDead = true;
+                }
+              });
+            }
+          } catch {
+            // ignore
+          }
+        }
+      },
+      markDead: () => {
+        if (this.activeSession && this.activeSession.taskName === taskName) {
+          this.activeSession.isDead = true;
         }
       },
       release: async () => {

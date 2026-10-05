@@ -30,14 +30,18 @@ export function isChromeClosedError(err: unknown): boolean {
 
 export type AbruptCloseListener = (reason: string) => void;
 
+export type Unsubscribe = () => void;
+
 export type AbruptCloseTracker = {
   markGraceful: () => void;
   isGraceful: () => boolean;
   isAbruptlyClosed: () => boolean;
   getAbruptReason: () => string;
-  onAbruptClose: (listener: AbruptCloseListener) => void;
+  onAbruptClose: (listener: AbruptCloseListener) => Unsubscribe;
   markAbruptlyClosed: (reason?: string) => void;
   attachBrowser: (browser: unknown, page?: unknown) => void;
+  clearListeners?: () => void;
+  dispose: () => void;
 };
 
 export function createAbruptCloseTracker(): AbruptCloseTracker {
@@ -66,7 +70,10 @@ export function createAbruptCloseTracker(): AbruptCloseTracker {
     isGraceful: () => closedGracefully,
     isAbruptlyClosed: () => abruptlyClosed,
     getAbruptReason: () => abruptReason,
-    onAbruptClose: (listener: AbruptCloseListener) => {
+    onAbruptClose: (listener: AbruptCloseListener): Unsubscribe => {
+      if (closedGracefully) {
+        return () => {};
+      }
       listeners.add(listener);
       if (abruptlyClosed) {
         try {
@@ -75,9 +82,21 @@ export function createAbruptCloseTracker(): AbruptCloseTracker {
           // Bỏ qua
         }
       }
+      return () => {
+        listeners.delete(listener);
+      };
     },
     markAbruptlyClosed: (reason?: string) => {
       triggerAbruptClose(reason ?? 'Phát hiện trình duyệt Chrome bị đóng đột ngột');
+    },
+    clearListeners: () => {
+      listeners.clear();
+    },
+    dispose: () => {
+      closedGracefully = true;
+      abruptlyClosed = false;
+      abruptReason = '';
+      listeners.clear();
     },
     attachBrowser: (browser: unknown, page?: unknown) => {
       if (!browser || typeof browser !== 'object') return;
