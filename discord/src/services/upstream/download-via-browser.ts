@@ -75,9 +75,30 @@ export type BrowserDownloadDeps = {
   challengeTimings?: { pollMs?: number; delay?: (ms: number) => Promise<void>; now?: () => number };
   onHeartbeat?: () => void;
   onProgress?: (bytes: number, status?: string) => void;
+  expectedSha256?: string;
+  downloadWaitMs?: number;
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | null = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
 
 type ChallengeWait = { cleared: true } | { cleared: false; interactive: boolean };
 
@@ -819,11 +840,13 @@ export async function downloadViaBrowser(
   versionName?: string,
 ): Promise<DownloadOutcome> {
   const log = deps.log ?? (() => undefined);
-  const dir = resolve(deps.tmpDir, `spigot-dl-${randomUUID()}`);
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { recursive: true });
+  let dir = '';
 
   try {
+    dir = resolve(deps.tmpDir, `spigot-dl-${randomUUID()}`);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+
     log(`resource ${resourceId}: mở trang`);
 
     const resourceWait = await openPastChallenge(page, `https://www.spigotmc.org/resources/${resourceId}/`, {
@@ -1029,11 +1052,12 @@ export async function downloadViaBrowser(
         })()` as never,
       ) as Promise<string>).catch(() => null);
 
+      type FetchOutcome =
+        | { ok: true; directStream?: boolean; data?: string; size: number }
+        | { ok: false; status?: number; text?: string; error?: string };
+      let fetchOutcome: FetchOutcome | null = null;
+
       if (fetchOutcomeRaw) {
-        type FetchOutcome =
-          | { ok: true; directStream?: boolean; data?: string; size: number }
-          | { ok: false; status?: number; text?: string; error?: string };
-        let fetchOutcome: FetchOutcome | null = null;
         try { fetchOutcome = JSON.parse(fetchOutcomeRaw) as FetchOutcome; } catch { }
 
         if (fetchOutcome?.ok) {
@@ -1069,6 +1093,14 @@ export async function downloadViaBrowser(
               try {
                 await writeFile(partPath, fileBuffer);
                 const sha256 = createHash('sha256').update(fileBuffer).digest('hex');
+                if (deps.expectedSha256 && sha256.toLowerCase() !== deps.expectedSha256.toLowerCase()) {
+                  await unlink(partPath).catch(() => undefined);
+                  log(`resource ${resourceId}: SHA256 không khớp (${sha256} != ${deps.expectedSha256})`);
+                  return {
+                    status: 'incomplete',
+                    detail: `SHA256 không khớp (${sha256.slice(0, 12)}… != ${deps.expectedSha256.slice(0, 12)}…)`,
+                  };
+                }
                 await rename(partPath, finalPath);
                 log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB (SHA256: ${sha256.slice(0, 12)}… qua fetch fallback)`);
                 return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
@@ -1087,58 +1119,66 @@ export async function downloadViaBrowser(
         }
       }
 
-      // Cách 2: Tải dự phòng bằng CDP + goto
-      log(`resource ${resourceId}: thử tải qua CDP + goto (dự phòng)…`);
+      let directStreamTriggered = false;
+      if (fetchOutcome?.ok && fetchOutcome.directStream) {
+        directStreamTriggered = true;
+      }
 
-      const openDownload = (): Promise<unknown> =>
-        page.goto(downloadUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
-      if (deps.solver) await deps.solver.prime(page, downloadUrl).catch(() => false);
-      await openDownload();
+      if (!directStreamTriggered) {
+        // Cách 2: Tải dự phòng bằng CDP + goto
+        log(`resource ${resourceId}: thử tải qua CDP + goto (dự phòng)…`);
 
-      let landedTitle = await page.title().catch(() => '');
-      if (/just a moment|checking your browser|attention required|cloudflare/i.test(landedTitle)) {
-        if (deps.solver) {
-          const solved = await deps.solver.solve(page, `https://www.spigotmc.org/resources/${resourceId}/`);
-          if (solved.ok) {
-            log(
-              `resource ${resourceId}: ${solved.reused ? 'dùng lại cf_clearance' : 'đã mua cf_clearance'} — tải lại`,
-            );
-            try { await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir }); } catch { }
-            try { await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true }); } catch { }
-            await openDownload();
-            landedTitle = await page.title().catch(() => '');
+        const openDownload = (): Promise<unknown> =>
+          page.goto(downloadUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => undefined);
+        if (deps.solver) await deps.solver.prime(page, downloadUrl).catch(() => false);
+        await openDownload();
+
+        let landedTitle = await page.title().catch(() => '');
+        if (/just a moment|checking your browser|attention required|cloudflare/i.test(landedTitle)) {
+          if (deps.solver) {
+            const solved = await deps.solver.solve(page, `https://www.spigotmc.org/resources/${resourceId}/`);
+            if (solved.ok) {
+              log(
+                `resource ${resourceId}: ${solved.reused ? 'dùng lại cf_clearance' : 'đã mua cf_clearance'} — tải lại`,
+              );
+              try { await cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir }); } catch { }
+              try { await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true }); } catch { }
+              await openDownload();
+              landedTitle = await page.title().catch(() => '');
+            } else {
+              log(`resource ${resourceId}: YesCaptcha không giải được: ${solved.detail}`);
+              return { status: 'challenged', detail: `Cloudflare chặn khi tải (${solved.detail})` };
+            }
           } else {
-            log(`resource ${resourceId}: YesCaptcha không giải được: ${solved.detail}`);
-            return { status: 'challenged', detail: `Cloudflare chặn khi tải (${solved.detail})` };
+            log(`resource ${resourceId}: Cloudflare chặn endpoint tải (chưa cấu hình YesCaptcha)`);
+            return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
           }
-        } else {
-          log(`resource ${resourceId}: Cloudflare chặn endpoint tải (chưa cấu hình YesCaptcha)`);
-          return { status: 'challenged', detail: 'Cloudflare chặn khi tải' };
+        }
+
+        const early = await readPageMessage(page);
+        const landedUnowned = await (page.evaluate(`(() => {
+          const text = document.body ? document.body.innerText || '' : '';
+          if (/do not have permission|not have access|must purchase|buy this/i.test(text)) return 'not_owned';
+          if (/must be logged in|log in to/i.test(text)) return 'cookie_dead';
+          const buy = document.querySelector('a[href*="/purchase"], a[href*="/buy"], .price');
+          const dl = document.querySelector('a[href*="/download"], label.downloadButton');
+          if (buy && !dl) return 'not_owned';
+          return null;
+        })()` as never) as Promise<string | null>).catch(() => null);
+
+        if (landedUnowned === 'not_owned' || /do not have permission|not have access|must purchase|buy this/i.test(early)) {
+          log(`resource ${resourceId}: trang nói không có quyền tải`);
+          return { status: 'not_owned' };
+        }
+        if (landedUnowned === 'cookie_dead' || /must be logged in|log in to/i.test(early)) {
+          log(`resource ${resourceId}: trang nói chưa đăng nhập`);
+          return { status: 'cookie_dead' };
         }
       }
 
-      const early = await readPageMessage(page);
-      const landedUnowned = await (page.evaluate(`(() => {
-        const text = document.body ? document.body.innerText || '' : '';
-        if (/do not have permission|not have access|must purchase|buy this/i.test(text)) return 'not_owned';
-        if (/must be logged in|log in to/i.test(text)) return 'cookie_dead';
-        const buy = document.querySelector('a[href*="/purchase"], a[href*="/buy"], .price');
-        const dl = document.querySelector('a[href*="/download"], label.downloadButton');
-        if (buy && !dl) return 'not_owned';
-        return null;
-      })()` as never) as Promise<string | null>).catch(() => null);
-
-      if (landedUnowned === 'not_owned' || /do not have permission|not have access|must purchase|buy this/i.test(early)) {
-        log(`resource ${resourceId}: trang nói không có quyền tải`);
-        return { status: 'not_owned' };
-      }
-      if (landedUnowned === 'cookie_dead' || /must be logged in|log in to/i.test(early)) {
-        log(`resource ${resourceId}: trang nói chưa đăng nhập`);
-        return { status: 'cookie_dead' };
-      }
-
-      const START_TIMEOUT_MS = 25_000;
-      const deadline = Date.now() + DOWNLOAD_WAIT_MS;
+      const waitTimeoutMs = deps.downloadWaitMs ?? DOWNLOAD_WAIT_MS;
+      const START_TIMEOUT_MS = Math.min(25_000, waitTimeoutMs);
+      const deadline = Date.now() + waitTimeoutMs;
       const startDeadline = Date.now() + START_TIMEOUT_MS;
       let lastReport = 0;
       let downloadStarted = false;
@@ -1146,7 +1186,8 @@ export async function downloadViaBrowser(
       while (Date.now() < deadline) {
         if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
         deps.onHeartbeat?.();
-        await sleep(2_000);
+        await abortableSleep(Math.min(2_000, waitTimeoutMs), deps.signal);
+        if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
 
         try {
           await page.title();
@@ -1224,6 +1265,14 @@ export async function downloadViaBrowser(
             return { status: 'incomplete', detail: `kích thước tệp không khớp (${fileBytes.length} != ${size})` };
           }
           const sha256 = createHash('sha256').update(fileBytes).digest('hex');
+          if (deps.expectedSha256 && sha256.toLowerCase() !== deps.expectedSha256.toLowerCase()) {
+            await unlink(partPath).catch(() => undefined);
+            log(`resource ${resourceId}: SHA256 không khớp (${sha256} != ${deps.expectedSha256})`);
+            return {
+              status: 'incomplete',
+              detail: `SHA256 không khớp (${sha256.slice(0, 12)}… != ${deps.expectedSha256.slice(0, 12)}…)`,
+            };
+          }
           await rename(partPath, finalPath);
           log(`resource ${resourceId}: tải xong ${(size / 1048576).toFixed(2)} MB (SHA256: ${sha256.slice(0, 12)}…) — ${files[0]}`);
           return { status: 'ok', tmpPath: finalPath, bytes: size, rotated: null };
@@ -1256,6 +1305,8 @@ export async function downloadViaBrowser(
     }
     return { status: 'error', detail: err instanceof Error ? err.message : String(err) };
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 }
