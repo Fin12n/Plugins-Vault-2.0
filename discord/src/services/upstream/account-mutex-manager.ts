@@ -67,6 +67,20 @@ export class AccountMutexManager {
   }
 
   /**
+   * Lấy số lượng tài khoản đang bị khóa tại thời điểm hiện tại.
+   */
+  public getActiveLockCount(): number {
+    return this.locks.size;
+  }
+
+  /**
+   * Reset hoàn toàn trạng thái (alias cho testing).
+   */
+  public clearForTest(): void {
+    this.reset();
+  }
+
+  /**
    * Lấy số lượng job đang xếp hàng chờ cho một tài khoản (hoặc toàn bộ hệ thống).
    */
   public getQueueLength(accountLabel?: string): number {
