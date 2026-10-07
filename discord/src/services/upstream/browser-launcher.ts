@@ -4,7 +4,9 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrowserLaunchOptions, BrowserLauncher, BrowserSession } from './download-via-browser.js';
 import { createAbruptCloseTracker, type AbruptCloseTracker } from './chrome-close-detector.js';
-import { cloakSessionManager } from './cloak-session-manager.js';
+import { cloakSessionManager, type SessionLockHandle } from './cloak-session-manager.js';
+import { accountMutexManager, type AccountLockHandle } from './account-mutex-manager.js';
+import { createDeadlineBudget, type DeadlineBudget, JobTimeoutError } from './deadline-budget.js';
 import { injectCookiesFromAccountFile } from './spigot-cookie-files.js';
 import {
   captureProcessIdentity,
@@ -379,6 +381,25 @@ export function createBrowserLauncher(
   return async (options: BrowserLaunchOptions = {}): Promise<BrowserSession> => {
     const isEphemeral = options.ephemeral ?? true;
     const isWarm = isEphemeral && warmBrowserManager.isWarmEnabled();
+    const acquisitionStart = Date.now();
+
+    // 1. Khởi tạo DeadlineBudget (nếu caller có cấu hình jobTimeoutMs)
+    const budget: DeadlineBudget | null = options.jobTimeoutMs
+      ? createDeadlineBudget({
+          jobTimeoutMs: options.jobTimeoutMs,
+          parentSignal: options.signal,
+          jobId: options.jobId,
+          startedAt: acquisitionStart,
+        })
+      : null;
+
+    const effectiveSignal = budget?.signal ?? options.signal;
+    if (effectiveSignal?.aborted) {
+      budget?.dispose();
+      const reason = effectiveSignal.reason;
+      if (reason instanceof Error) throw reason;
+      throw new Error(String(reason ?? '[BrowserLauncher] Yêu cầu khởi chạy bị hủy do signal aborted'));
+    }
 
     const taskName = options.accountLabel
       ? `account-${options.accountLabel}`
@@ -433,9 +454,69 @@ export function createBrowserLauncher(
       ...(proxyUrl ? { proxy: proxyUrl } : {}),
     };
 
+    /*
+     * ========================================================================
+     * CANONICAL LOCK ORDERING:
+     * 1. Global Scheduling Admission (kiểm tra không bị shutdown)
+     * 2. Account Mutex (accountMutexManager.acquire(options.accountLabel))
+     * 3. Browser Session Resource (cloakSessionManager.acquireLock(taskName))
+     *
+     * Thứ tự giải phóng bắt buộc theo chiều ngược lại (Reverse order):
+     * 1. Browser Session Resource (lockHandle.release())
+     * 2. Account Mutex (accountLock.release())
+     * ========================================================================
+     */
+    let accountLock: AccountLockHandle | null = null;
+    const lockWaitStart = Date.now();
+
+    if (options.accountLabel) {
+      try {
+        const remainingForAccount = budget ? budget.getRemainingMs() : undefined;
+        if (remainingForAccount !== undefined && remainingForAccount <= 0) {
+          throw new JobTimeoutError(
+            `[BrowserLauncher] Hết hạn chót trước khi chờ khóa tài khoản "${options.accountLabel}"`,
+            budget!.deadline,
+            budget!.startedAt,
+            options.jobId,
+          );
+        }
+        accountLock = await accountMutexManager.acquire(options.accountLabel, {
+          signal: effectiveSignal,
+          timeoutMs: remainingForAccount,
+          jobId: options.jobId,
+        });
+      } catch (accLockErr) {
+        budget?.dispose();
+        throw accLockErr;
+      }
+    }
+
     if (isWarm) {
       console.log(`[BrowserLauncher] Sử dụng WARM CloakBrowser session (account-isolated, ephemeral=${isEphemeral})`);
-      const lockHandle = await cloakSessionManager.acquireLock(taskName);
+      let lockHandle: SessionLockHandle;
+      try {
+        const remainingForBrowser = budget ? budget.getRemainingMs() : undefined;
+        if (remainingForBrowser !== undefined && remainingForBrowser <= 0) {
+          throw new JobTimeoutError(
+            `[BrowserLauncher] Hết hạn chót trước khi nhận khóa warm browser cho "${taskName}"`,
+            budget!.deadline,
+            budget!.startedAt,
+            options.jobId,
+          );
+        }
+        lockHandle = await cloakSessionManager.acquireLock(taskName, {
+          signal: effectiveSignal,
+          waitTimeoutMs: remainingForBrowser,
+        });
+      } catch (lockErr) {
+        if (accountLock) await accountLock.release().catch(() => undefined);
+        budget?.dispose();
+        throw lockErr;
+      }
+
+      const lockWaitMs = Date.now() - lockWaitStart;
+      console.log(`[BrowserLauncher] 🔒 Đã cấp khóa [Canonical: Account -> BrowserSession]: job_id=${options.jobId ?? 'none'} account_id=${options.accountLabel ?? 'none'} lock_wait_ms=${lockWaitMs} remaining_ms=${budget ? budget.getRemainingMs() : 'inf'}`);
+
       let warmInstance: WarmBrowserInstance;
       try {
         const acquired = await warmBrowserManager.acquireWarmBrowser(cloak, baseConfig);
@@ -449,6 +530,8 @@ export function createBrowserLauncher(
         }
       } catch (launchErr) {
         await lockHandle.release();
+        if (accountLock) await accountLock.release().catch(() => undefined);
+        budget?.dispose();
         throw launchErr;
       }
 
@@ -487,6 +570,8 @@ export function createBrowserLauncher(
         await lockHandle.release().catch((relErr) => {
           console.warn('[BrowserLauncher] Lỗi giải phóng lock sau warm setup failure:', relErr);
         });
+        if (accountLock) await accountLock.release().catch(() => undefined);
+        budget?.dispose();
         throw setupErr;
       }
 
@@ -496,6 +581,8 @@ export function createBrowserLauncher(
           if (tracker) tracker.dispose();
           await warmBrowserManager.releaseSessionPage(page!);
           await lockHandle.release();
+          if (accountLock) await accountLock.release().catch(() => undefined);
+          budget?.dispose();
         },
         isAbruptlyClosed: () => tracker ? tracker.isAbruptlyClosed() : false,
         onAbruptClose: (callback) => tracker ? tracker.onAbruptClose(callback) : (() => {}),
@@ -526,7 +613,33 @@ export function createBrowserLauncher(
 
     console.log(`[BrowserLauncher] Khởi chạy CloakBrowser phiên trắng (ephemeral=${isEphemeral}): headless=${isHeadless}, viewport=1920x1080`);
 
-    const lockHandle = await cloakSessionManager.acquireLock(taskName, dir);
+    let lockHandle: SessionLockHandle;
+    try {
+      const remainingForBrowser = budget ? budget.getRemainingMs() : undefined;
+      if (remainingForBrowser !== undefined && remainingForBrowser <= 0) {
+        throw new JobTimeoutError(
+          `[BrowserLauncher] Hết hạn chót trước khi nhận khóa cold browser cho "${taskName}"`,
+          budget!.deadline,
+          budget!.startedAt,
+          options.jobId,
+        );
+      }
+      lockHandle = await cloakSessionManager.acquireLock(taskName, {
+        tempProfileDir: dir,
+        signal: effectiveSignal,
+        waitTimeoutMs: remainingForBrowser,
+      });
+    } catch (lockErr) {
+      if (accountLock) await accountLock.release().catch(() => undefined);
+      budget?.dispose();
+      if (isEphemeral && dir && existsSync(dir)) {
+        try { rmSync(dir, { recursive: true, force: true }); } catch { }
+      }
+      throw lockErr;
+    }
+
+    const lockWaitMs = Date.now() - lockWaitStart;
+    console.log(`[BrowserLauncher] 🔒 Đã cấp khóa [Canonical: Account -> BrowserSession]: job_id=${options.jobId ?? 'none'} account_id=${options.accountLabel ?? 'none'} lock_wait_ms=${lockWaitMs} remaining_ms=${budget ? budget.getRemainingMs() : 'inf'}`);
 
     let browser: {
       close: () => Promise<void>;
@@ -568,6 +681,8 @@ export function createBrowserLauncher(
       await lockHandle.release().catch((relErr) => {
         console.warn('[BrowserLauncher] Lỗi giải phóng lock sau launch failure:', relErr);
       });
+      if (accountLock) await accountLock.release().catch(() => undefined);
+      budget?.dispose();
       if (isEphemeral && dir && existsSync(dir)) {
         try {
           rmSync(dir, { recursive: true, force: true });
@@ -611,6 +726,8 @@ export function createBrowserLauncher(
       await lockHandle.release().catch((relErr) => {
         console.warn('[BrowserLauncher] Lỗi giải phóng lock sau setup failure:', relErr);
       });
+      if (accountLock) await accountLock.release().catch(() => undefined);
+      budget?.dispose();
       if (isEphemeral && dir && existsSync(dir)) {
         try {
           rmSync(dir, { recursive: true, force: true });
@@ -627,6 +744,8 @@ export function createBrowserLauncher(
         if (tracker) tracker.dispose();
         await closeBrowser(browser, 8_000, expectedIdentity ?? undefined).catch(() => undefined);
         await lockHandle.release();
+        if (accountLock) await accountLock.release().catch(() => undefined);
+        budget?.dispose();
         // Xóa sạch thư mục session tạm thời -> Dữ liệu hoàn toàn đi vào hư vô!
         if (isEphemeral && dir && existsSync(dir)) {
           try {

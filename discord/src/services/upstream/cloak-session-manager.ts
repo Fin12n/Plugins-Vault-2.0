@@ -2,6 +2,8 @@ import { existsSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { terminateProcessTree } from './process-tree-killer.js';
+import { accountMutexManager } from './account-mutex-manager.js';
+import { JobTimeoutError } from './deadline-budget.js';
 
 /**
  * Lỗi phát sinh khi có yêu cầu mở session CloakBrowser mới trong khi
@@ -27,7 +29,37 @@ export type ActiveSessionInfo = {
   } | null;
   tempProfileDir?: string;
   isDead?: boolean;
+  browserHandler?: () => void;
+  procHandler?: () => void;
 };
+
+function unbindSessionListeners(session: ActiveSessionInfo): void {
+  if (session.browser) {
+    const b = session.browser as unknown as { off?: (event: string, cb: () => void) => void; removeListener?: (event: string, cb: () => void) => void };
+    if (session.browserHandler) {
+      try {
+        if (typeof b.off === 'function') {
+          b.off('disconnected', session.browserHandler);
+        } else if (typeof b.removeListener === 'function') {
+          b.removeListener('disconnected', session.browserHandler);
+        }
+      } catch { }
+      session.browserHandler = undefined;
+    }
+
+    try {
+      const proc = session.browser.process?.() as unknown as { off?: (event: string, cb: () => void) => void; removeListener?: (event: string, cb: () => void) => void } | null;
+      if (proc && session.procHandler) {
+        if (typeof proc.off === 'function') {
+          proc.off('exit', session.procHandler);
+        } else if (typeof proc.removeListener === 'function') {
+          proc.removeListener('exit', session.procHandler);
+        }
+        session.procHandler = undefined;
+      }
+    } catch { }
+  }
+}
 
 export type SessionLockHandle = {
   taskName: string;
@@ -61,6 +93,7 @@ type QueueWaiter = {
 class CloakSessionManager {
   private activeSession: ActiveSessionInfo | null = null;
   private waitQueue: QueueWaiter[] = [];
+  private isStopping = false;
 
   /**
    * Kiểm tra xem hiện có session CloakBrowser nào đang hoạt động hay không.
@@ -137,25 +170,28 @@ class CloakSessionManager {
       startedAt: sessionInfo.startedAt,
       registerBrowser: (browser: ActiveSessionInfo['browser']) => {
         if (this.activeSession && this.activeSession.taskName === taskName) {
+          unbindSessionListeners(this.activeSession);
           this.activeSession.browser = browser;
 
           const bAny = browser as unknown as { on?: (event: string, cb: () => void) => void };
           if (bAny && typeof bAny.on === 'function') {
-            bAny.on('disconnected', () => {
+            this.activeSession.browserHandler = () => {
               if (this.activeSession && this.activeSession.browser === browser) {
                 this.activeSession.isDead = true;
               }
-            });
+            };
+            bAny.on('disconnected', this.activeSession.browserHandler);
           }
 
           try {
             const proc = browser?.process?.() as unknown as { on?: (event: string, cb: () => void) => void } | null;
             if (proc && typeof proc.on === 'function') {
-              proc.on('exit', () => {
+              this.activeSession.procHandler = () => {
                 if (this.activeSession && this.activeSession.browser === browser) {
                   this.activeSession.isDead = true;
                 }
-              });
+              };
+              proc.on('exit', this.activeSession.procHandler);
             }
           } catch {
             // ignore
@@ -169,6 +205,7 @@ class CloakSessionManager {
       },
       release: async () => {
         if (this.activeSession && this.activeSession.taskName === taskName) {
+          unbindSessionListeners(this.activeSession);
           this.activeSession.browser = null;
         }
         await this.releaseLock(taskName);
@@ -187,13 +224,19 @@ class CloakSessionManager {
     taskName: string,
     optionsOrTempDir?: string | AcquireOptions,
   ): Promise<SessionLockHandle> {
+    if (this.isStopping) {
+      throw new Error(`[CloakSessionManager] Từ chối cấp khóa cho "${taskName}": Hệ thống đang trong quá trình shutdown`);
+    }
+
     const options: AcquireOptions =
       typeof optionsOrTempDir === 'string'
         ? { tempProfileDir: optionsOrTempDir }
         : (optionsOrTempDir ?? {});
 
     if (options.signal?.aborted) {
-      throw new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho "${taskName}" đã bị hủy trước khi bắt đầu`);
+      const reason = options.signal.reason;
+      if (reason instanceof JobTimeoutError) throw reason;
+      throw new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho "${taskName}" đã bị hủy bởi caller`);
     }
 
     if (this.activeSession !== null) {
@@ -223,7 +266,11 @@ class CloakSessionManager {
           if (timeoutMs > 0 && timeoutMs !== Infinity) {
             timeoutTimer = setTimeout(() => {
               removeWaiter();
-              reject(new Error(`[CloakSessionManager] Hết thời gian chờ cấp khóa (${timeoutMs}ms) cho tác vụ "${taskName}"`));
+              reject(new JobTimeoutError(
+                `[CloakSessionManager] Hết thời gian chờ cấp khóa (${timeoutMs}ms) cho tác vụ "${taskName}"`,
+                Date.now() + timeoutMs,
+                Date.now(),
+              ));
             }, timeoutMs);
             timeoutTimer.unref();
           }
@@ -232,7 +279,12 @@ class CloakSessionManager {
           if (options.signal) {
             onAbort = () => {
               removeWaiter();
-              reject(new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho tác vụ "${taskName}" đã bị hủy bởi caller`));
+              const reason = options.signal?.reason;
+              if (reason instanceof JobTimeoutError) {
+                reject(reason);
+              } else {
+                reject(new Error(`[CloakSessionManager] Yêu cầu cấp khóa cho tác vụ "${taskName}" đã bị hủy bởi caller`));
+              }
             };
             options.signal.addEventListener('abort', onAbort, { once: true });
           }
@@ -277,6 +329,7 @@ class CloakSessionManager {
 
     const session = this.activeSession;
     this.activeSession = null;
+    unbindSessionListeners(session);
 
     // 1. Đóng trình duyệt triệt để
     if (session.browser) {
@@ -366,11 +419,40 @@ class CloakSessionManager {
   }
 
   /**
+   * Dừng toàn bộ hệ thống CloakSessionManager và giải tán hàng đợi có bounded deadline (SIGTERM/SIGINT).
+   */
+  public async stop(reason = 'System shutdown', timeoutMs = 5000): Promise<void> {
+    this.isStopping = true;
+    this.drainQueue(reason);
+    accountMutexManager.cancelWaiters(reason);
+
+    if (this.activeSession) {
+      let timer: NodeJS.Timeout | null = null;
+      try {
+        await Promise.race([
+          this.releaseLock(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, timeoutMs);
+            timer.unref();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+  }
+
+  /**
    * Reset hoàn toàn trạng thái lock và queue (dùng trong test hoặc phục hồi khẩn cấp).
    */
   public reset(): void {
     this.drainQueue('Reset manager');
+    accountMutexManager.reset();
+    if (this.activeSession) {
+      unbindSessionListeners(this.activeSession);
+    }
     this.activeSession = null;
+    this.isStopping = false;
   }
 }
 

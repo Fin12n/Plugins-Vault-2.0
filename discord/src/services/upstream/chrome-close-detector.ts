@@ -50,6 +50,21 @@ export function createAbruptCloseTracker(): AbruptCloseTracker {
   let abruptReason = '';
   const listeners = new Set<AbruptCloseListener>();
 
+  // Lưu trữ tham chiếu chính xác các event handlers để unbind sạch sẽ
+  let browserHandler: (() => void) | null = null;
+  let processHandler: ((code: unknown, signal: unknown) => void) | null = null;
+  let pageHandler: (() => void) | null = null;
+
+  type EventEmitters = {
+    on?: (event: string, handler: (...args: unknown[]) => void) => void;
+    off?: (event: string, handler: (...args: unknown[]) => void) => void;
+    removeListener?: (event: string, handler: (...args: unknown[]) => void) => void;
+  };
+
+  let attachedBrowser: EventEmitters | null = null;
+  let attachedProcess: EventEmitters | null = null;
+  let attachedPage: EventEmitters | null = null;
+
   const triggerAbruptClose = (reason: string) => {
     if (closedGracefully || abruptlyClosed) return;
     abruptlyClosed = true;
@@ -60,6 +75,19 @@ export function createAbruptCloseTracker(): AbruptCloseTracker {
       } catch {
         // Bỏ qua lỗi trong listener
       }
+    }
+  };
+
+  const removeHandler = (target: EventEmitters | null, event: string, handler: ((...args: unknown[]) => void) | null) => {
+    if (!target || !handler) return;
+    try {
+      if (typeof target.off === 'function') {
+        target.off(event, handler);
+      } else if (typeof target.removeListener === 'function') {
+        target.removeListener(event, handler);
+      }
+    } catch {
+      // Bỏ qua lỗi nếu target đã bị đóng
     }
   };
 
@@ -97,40 +125,73 @@ export function createAbruptCloseTracker(): AbruptCloseTracker {
       abruptlyClosed = false;
       abruptReason = '';
       listeners.clear();
+
+      // Gỡ bỏ chính xác các handler đã đăng ký để chống memory leak & MaxListenersExceeded
+      if (attachedBrowser && browserHandler) {
+        removeHandler(attachedBrowser, 'disconnected', browserHandler);
+        browserHandler = null;
+        attachedBrowser = null;
+      }
+
+      if (attachedProcess && processHandler) {
+        removeHandler(attachedProcess, 'exit', processHandler as (...args: unknown[]) => void);
+        processHandler = null;
+        attachedProcess = null;
+      }
+
+      if (attachedPage && pageHandler) {
+        removeHandler(attachedPage, 'close', pageHandler);
+        pageHandler = null;
+        attachedPage = null;
+      }
     },
     attachBrowser: (browser: unknown, page?: unknown) => {
       if (!browser || typeof browser !== 'object') return;
 
-      const b = browser as {
-        on?: (event: string, handler: (...args: unknown[]) => void) => void;
-        process?: () => { on?: (event: string, handler: (...args: unknown[]) => void) => void } | null;
+      const b = browser as EventEmitters & {
+        process?: () => EventEmitters | null;
       };
 
+      // Nếu trước đó đã attach, gỡ bỏ handler cũ trước khi gán mới
+      if (attachedBrowser && browserHandler) {
+        removeHandler(attachedBrowser, 'disconnected', browserHandler);
+      }
+      if (attachedProcess && processHandler) {
+        removeHandler(attachedProcess, 'exit', processHandler as (...args: unknown[]) => void);
+      }
+      if (attachedPage && pageHandler) {
+        removeHandler(attachedPage, 'close', pageHandler);
+      }
+
+      attachedBrowser = b;
+      browserHandler = () => {
+        triggerAbruptClose('Trình duyệt Chrome đã mất kết nối hoặc bị đóng');
+      };
       if (typeof b.on === 'function') {
-        b.on('disconnected', () => {
-          triggerAbruptClose('Trình duyệt Chrome đã mất kết nối hoặc bị đóng');
-        });
+        b.on('disconnected', browserHandler);
       }
 
       try {
         const proc = b.process?.();
         if (proc && typeof proc.on === 'function') {
-          proc.on('exit', (code: unknown, signal: unknown) => {
+          attachedProcess = proc;
+          processHandler = (code: unknown, signal: unknown) => {
             triggerAbruptClose(`Tiến trình Chrome đã tắt (mã: ${code ?? signal ?? 'unknown'})`);
-          });
+          };
+          proc.on('exit', processHandler as (...args: unknown[]) => void);
         }
       } catch {
         // Bỏ qua nếu môi trường không hỗ trợ process()
       }
 
       if (page && typeof page === 'object') {
-        const p = page as {
-          on?: (event: string, handler: (...args: unknown[]) => void) => void;
-        };
+        const p = page as EventEmitters;
         if (typeof p.on === 'function') {
-          p.on('close', () => {
+          attachedPage = p;
+          pageHandler = () => {
             triggerAbruptClose('Cửa sổ trang Chrome đã bị đóng');
-          });
+          };
+          p.on('close', pageHandler);
         }
       }
     },

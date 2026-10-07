@@ -61,6 +61,9 @@ export type BrowserLaunchOptions = {
   headless?: boolean;
   ephemeral?: boolean;
   accountLabel?: string;
+  jobTimeoutMs?: number;
+  signal?: AbortSignal;
+  jobId?: string;
 };
 
 export type BrowserLauncher = (options?: BrowserLaunchOptions) => Promise<BrowserSession>;
@@ -79,11 +82,14 @@ export type BrowserDownloadDeps = {
   downloadWaitMs?: number;
   resourcePageUrl?: string;
   downloadUrl?: string;
+  deadline?: number;
+  jobTimeoutMs?: number;
+  jobId?: string;
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+export async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return;
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout | null = null;
@@ -1179,18 +1185,34 @@ export async function downloadViaBrowser(
         }
       }
 
-      const waitTimeoutMs = deps.downloadWaitMs ?? DOWNLOAD_WAIT_MS;
+      const parentDeadline = deps.deadline ?? (deps.jobTimeoutMs ? (Date.now() + deps.jobTimeoutMs) : undefined);
+      let effectiveWaitMs = deps.downloadWaitMs ?? DOWNLOAD_WAIT_MS;
+      if (parentDeadline !== undefined) {
+        const remaining = parentDeadline - Date.now();
+        if (remaining <= 0) {
+          return { status: 'error', detail: 'job_timeout: quá thời hạn deadline tổng' };
+        }
+        effectiveWaitMs = Math.min(effectiveWaitMs, remaining);
+      }
+
+      const waitTimeoutMs = effectiveWaitMs;
       const START_TIMEOUT_MS = Math.min(25_000, waitTimeoutMs);
-      const deadline = Date.now() + waitTimeoutMs;
+      const deadline = parentDeadline !== undefined ? Math.min(Date.now() + waitTimeoutMs, parentDeadline) : (Date.now() + waitTimeoutMs);
       const startDeadline = Date.now() + START_TIMEOUT_MS;
       let lastReport = 0;
       let downloadStarted = false;
 
       while (Date.now() < deadline) {
         if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
+        if (parentDeadline !== undefined && Date.now() >= parentDeadline) {
+          return { status: 'error', detail: 'job_timeout: quá thời hạn deadline tổng' };
+        }
         deps.onHeartbeat?.();
         await abortableSleep(Math.min(2_000, waitTimeoutMs), deps.signal);
         if (deps.signal?.aborted) return { status: 'error', detail: 'đang tắt tiến trình' };
+        if (parentDeadline !== undefined && Date.now() >= parentDeadline) {
+          return { status: 'error', detail: 'job_timeout: quá thời hạn deadline tổng' };
+        }
 
         try {
           await page.title();
