@@ -3,9 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrowserLaunchOptions, BrowserLauncher, BrowserSession } from './download-via-browser.js';
-import { createAbruptCloseTracker } from './chrome-close-detector.js';
+import { createAbruptCloseTracker, type AbruptCloseTracker } from './chrome-close-detector.js';
 import { cloakSessionManager } from './cloak-session-manager.js';
 import { injectCookiesFromAccountFile } from './spigot-cookie-files.js';
+import {
+  captureProcessIdentity,
+  terminateProcessTree,
+  type ProcessIdentity,
+} from './process-tree-killer.js';
 
 export function makeWindowsProcessVisible(pid?: number): void {
   if (process.platform !== 'win32') return;
@@ -57,10 +62,10 @@ if ($targetPid -gt 0) {
   exec(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, () => { });
 }
 
-type CloakModule = {
+export type CloakModule = {
   launch: (options?: Record<string, unknown>) => Promise<{
     close: () => Promise<void>;
-    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean } | null;
+    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean; pid?: number } | null;
     pages: () => Promise<unknown[]>;
     newPage: () => Promise<unknown>;
   }>;
@@ -73,12 +78,17 @@ export type LauncherProbe =
 export async function closeBrowser(
   browser: {
     close: () => Promise<void>;
-    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean } | null;
+    process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean; pid?: number } | null;
   },
   timeoutMs = 8_000,
+  expectedIdentity?: ProcessIdentity,
 ): Promise<void> {
   let timer: NodeJS.Timeout | null = null;
   try {
+    const proc = browser.process?.();
+    const pid = (proc as { pid?: number })?.pid;
+    const identity = expectedIdentity ?? (pid && pid > 0 ? await captureProcessIdentity(pid) : null);
+
     const graceful = await Promise.race([
       browser.close().then(
         () => true,
@@ -90,18 +100,13 @@ export async function closeBrowser(
       }),
     ]);
     if (!graceful) {
-      try {
-        const proc = browser.process?.();
-        if (proc) {
+      if (pid && typeof pid === 'number' && pid > 0) {
+        await terminateProcessTree(pid, identity ?? undefined);
+      } else if (proc) {
+        try {
           proc.kill('SIGKILL');
-          const pid = (proc as { pid?: number }).pid;
-          if (process.platform === 'linux' && pid && typeof pid === 'number') {
-            try {
-              process.kill(-pid, 'SIGKILL');
-            } catch { }
-          }
-        }
-      } catch { }
+        } catch { }
+      }
     }
   } finally {
     if (timer) clearTimeout(timer);
@@ -362,7 +367,16 @@ export async function probeBrowserLauncher(
     process.env.DISPLAY = ':99';
   }
 
-  const launch: BrowserLauncher = async (options: BrowserLaunchOptions = {}): Promise<BrowserSession> => {
+  const launch = createBrowserLauncher(cloak, profileDir, _launcherOptions);
+  return { available: true, launch };
+}
+
+export function createBrowserLauncher(
+  cloak: CloakModule,
+  profileDir?: string,
+  _launcherOptions?: Record<string, unknown>,
+): BrowserLauncher {
+  return async (options: BrowserLaunchOptions = {}): Promise<BrowserSession> => {
     const isEphemeral = options.ephemeral ?? true;
     const isWarm = isEphemeral && warmBrowserManager.isWarmEnabled();
 
@@ -438,50 +452,55 @@ export async function probeBrowserLauncher(
         throw launchErr;
       }
 
-      const tracker = createAbruptCloseTracker();
-      const page = (await warmInstance.newPage()) as BrowserSession['page'];
-      tracker.attachBrowser(warmInstance, page);
-      tracker.onAbruptClose(() => {
-        lockHandle.markDead();
-        warmBrowserManager.reset();
-      });
+      let tracker: AbruptCloseTracker | null = null;
+      let page: BrowserSession['page'] | null = null;
 
-      // Strict account isolation: sanitize before use
-      await warmBrowserManager.sanitizePage(page);
+      try {
+        tracker = createAbruptCloseTracker();
+        page = (await warmInstance.newPage()) as BrowserSession['page'];
+        tracker.attachBrowser(warmInstance, page);
+        tracker.onAbruptClose(() => {
+          lockHandle.markDead();
+          warmBrowserManager.reset();
+        });
 
-      if (options.proxyServer && options.proxyUsername && options.proxyPassword && page.authenticate) {
-        try {
+        // Strict account isolation: sanitize before use
+        await warmBrowserManager.sanitizePage(page);
+
+        if (options.proxyServer && options.proxyUsername && options.proxyPassword && page.authenticate) {
           await page.authenticate({ username: options.proxyUsername, password: options.proxyPassword });
-        } catch (err) {
-          tracker.dispose();
-          await warmBrowserManager.releaseSessionPage(page);
-          await lockHandle.release();
-          throw err;
         }
-      }
 
-      if (options.accountLabel) {
-        try {
+        if (options.accountLabel) {
           const injected = await injectCookiesFromAccountFile(page, options.accountLabel);
           if (injected) {
             console.log(`[BrowserLauncher] 🍪 Đã tiêm cookies lưu sẵn từ ./data/cookie/${options.accountLabel}/* vào phiên warm.`);
           }
-        } catch (injectErr) {
-          console.warn(`[BrowserLauncher] Không thể tiêm cookies cho "${options.accountLabel}":`, injectErr);
         }
+      } catch (setupErr) {
+        if (tracker) {
+          try { tracker.dispose(); } catch { }
+        }
+        if (page) {
+          await warmBrowserManager.releaseSessionPage(page).catch(() => undefined);
+        }
+        await lockHandle.release().catch((relErr) => {
+          console.warn('[BrowserLauncher] Lỗi giải phóng lock sau warm setup failure:', relErr);
+        });
+        throw setupErr;
       }
 
       return {
-        page,
+        page: page!,
         close: async () => {
-          tracker.dispose();
-          await warmBrowserManager.releaseSessionPage(page);
+          if (tracker) tracker.dispose();
+          await warmBrowserManager.releaseSessionPage(page!);
           await lockHandle.release();
         },
-        isAbruptlyClosed: () => tracker.isAbruptlyClosed(),
-        onAbruptClose: (callback) => tracker.onAbruptClose(callback),
+        isAbruptlyClosed: () => tracker ? tracker.isAbruptlyClosed() : false,
+        onAbruptClose: (callback) => tracker ? tracker.onAbruptClose(callback) : (() => {}),
         markAbruptlyClosed: (reason) => {
-          tracker.markAbruptlyClosed(reason);
+          tracker?.markAbruptlyClosed(reason);
           warmBrowserManager.reset();
         },
       };
@@ -511,10 +530,12 @@ export async function probeBrowserLauncher(
 
     let browser: {
       close: () => Promise<void>;
-      process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean } | null;
+      process?: () => { kill: (signal?: NodeJS.Signals | number) => boolean; pid?: number } | null;
       pages: () => Promise<unknown[]>;
       newPage: () => Promise<unknown>;
-    };
+    } | null = null;
+
+    let expectedIdentity: ProcessIdentity | null = null;
 
     try {
       try {
@@ -534,73 +555,90 @@ export async function probeBrowserLauncher(
 
       const proc = browser.process?.();
       const pid = (proc as { pid?: number })?.pid;
-      if (process.platform === 'win32' && !isHeadless && pid) {
-        makeWindowsProcessVisible(pid);
+      if (pid && typeof pid === 'number' && pid > 0) {
+        expectedIdentity = await captureProcessIdentity(pid);
+        if (process.platform === 'win32' && !isHeadless) {
+          makeWindowsProcessVisible(pid);
+        }
       }
     } catch (launchErr) {
-      await lockHandle.release();
+      if (browser) {
+        await closeBrowser(browser, 5_000, expectedIdentity ?? undefined).catch(() => undefined);
+      }
+      await lockHandle.release().catch((relErr) => {
+        console.warn('[BrowserLauncher] Lỗi giải phóng lock sau launch failure:', relErr);
+      });
       if (isEphemeral && dir && existsSync(dir)) {
         try {
           rmSync(dir, { recursive: true, force: true });
-        } catch { }
+        } catch (rmErr) {
+          console.warn(`[BrowserLauncher] Cảnh báo: Không thể dọn dẹp thư mục profile "${dir}":`, rmErr);
+        }
       }
       throw launchErr;
     }
 
-    const tracker = createAbruptCloseTracker();
-    const pages = await browser.pages();
-    const page = (pages.length > 0 ? pages[0] : await browser.newPage()) as BrowserSession['page'];
-    tracker.attachBrowser(browser, page);
-    tracker.onAbruptClose(() => {
-      lockHandle.markDead();
-    });
+    let tracker: AbruptCloseTracker | null = null;
+    let page: BrowserSession['page'] | null = null;
 
-    if (options.proxyServer && options.proxyUsername && options.proxyPassword && page.authenticate) {
-      try {
+    try {
+      tracker = createAbruptCloseTracker();
+      const pages = await browser.pages();
+      page = (pages.length > 0 ? pages[0] : await browser.newPage()) as BrowserSession['page'];
+      tracker.attachBrowser(browser, page);
+      tracker.onAbruptClose(() => {
+        lockHandle.markDead();
+      });
+
+      if (options.proxyServer && options.proxyUsername && options.proxyPassword && page.authenticate) {
         await page.authenticate({ username: options.proxyUsername, password: options.proxyPassword });
-      } catch (err) {
-        tracker.dispose();
-        await closeBrowser(browser).catch(() => undefined);
-        await lockHandle.release();
-        if (isEphemeral && dir && existsSync(dir)) {
-          try {
-            rmSync(dir, { recursive: true, force: true });
-          } catch { }
-        }
-        throw err;
       }
-    }
 
-    // Nếu có chỉ định accountLabel, tự động nạp cookies từ ./data/cookie/{account}/* vào phiên trắng
-    if (options.accountLabel) {
-      try {
+      // Nếu có chỉ định accountLabel, tự động nạp cookies từ ./data/cookie/{account}/* vào phiên trắng
+      if (options.accountLabel) {
         const injected = await injectCookiesFromAccountFile(page, options.accountLabel);
         if (injected) {
           console.log(`[BrowserLauncher] 🍪 Đã tiêm cookies lưu sẵn từ ./data/cookie/${options.accountLabel}/* vào phiên trình duyệt trắng.`);
         }
-      } catch (injectErr) {
-        console.warn(`[BrowserLauncher] Không thể tiêm cookies cho "${options.accountLabel}":`, injectErr);
       }
+    } catch (setupErr) {
+      if (tracker) {
+        try { tracker.dispose(); } catch { }
+      }
+      if (browser) {
+        await closeBrowser(browser, 5_000, expectedIdentity ?? undefined).catch(() => undefined);
+      }
+      await lockHandle.release().catch((relErr) => {
+        console.warn('[BrowserLauncher] Lỗi giải phóng lock sau setup failure:', relErr);
+      });
+      if (isEphemeral && dir && existsSync(dir)) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (rmErr) {
+          console.warn(`[BrowserLauncher] Cảnh báo: Không thể dọn dẹp thư mục profile "${dir}":`, rmErr);
+        }
+      }
+      throw setupErr;
     }
 
     return {
-      page,
+      page: page!,
       close: async () => {
-        tracker.dispose();
-        await closeBrowser(browser).catch(() => undefined);
+        if (tracker) tracker.dispose();
+        await closeBrowser(browser, 8_000, expectedIdentity ?? undefined).catch(() => undefined);
         await lockHandle.release();
         // Xóa sạch thư mục session tạm thời -> Dữ liệu hoàn toàn đi vào hư vô!
         if (isEphemeral && dir && existsSync(dir)) {
           try {
             rmSync(dir, { recursive: true, force: true });
-          } catch { }
+          } catch (rmErr) {
+            console.warn(`[BrowserLauncher] Cảnh báo: Không thể dọn dẹp thư mục profile "${dir}":`, rmErr);
+          }
         }
       },
-      isAbruptlyClosed: () => tracker.isAbruptlyClosed(),
-      onAbruptClose: (callback) => tracker.onAbruptClose(callback),
-      markAbruptlyClosed: (reason) => tracker.markAbruptlyClosed(reason),
+      isAbruptlyClosed: () => tracker ? tracker.isAbruptlyClosed() : false,
+      onAbruptClose: (callback) => tracker ? tracker.onAbruptClose(callback) : (() => {}),
+      markAbruptlyClosed: (reason) => tracker?.markAbruptlyClosed(reason),
     };
   };
-
-  return { available: true, launch };
 }

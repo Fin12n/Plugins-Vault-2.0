@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { terminateProcessTree } from './process-tree-killer.js';
 
 /**
  * Lỗi phát sinh khi có yêu cầu mở session CloakBrowser mới trong khi
@@ -294,16 +295,13 @@ class CloakSessionManager {
         if (!graceful) {
           try {
             const proc = session.browser.process?.();
-            if (proc) {
-              proc.kill('SIGKILL');
-              const pid = (proc as { pid?: number }).pid;
-              if (process.platform === 'linux' && pid && typeof pid === 'number') {
-                try {
-                  process.kill(-pid, 'SIGKILL');
-                } catch {
-                  // ignore
-                }
-              }
+            const pid = (proc as { pid?: number })?.pid;
+            if (pid && typeof pid === 'number' && pid > 0) {
+              await terminateProcessTree(pid);
+            } else if (proc) {
+              try {
+                proc.kill('SIGKILL');
+              } catch { }
             }
           } catch {
             // Process may already have terminated
