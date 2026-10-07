@@ -1,4 +1,4 @@
-import { eq, and, or, ilike, desc, sql } from "drizzle-orm";
+import { eq, and, or, ilike, desc, asc, lte, isNull, sql } from "drizzle-orm";
 import type { Database } from "../db/neon.js";
 import { plugins, versions, type Plugin, type NewPlugin } from "@vault/db";
 
@@ -355,4 +355,58 @@ export async function getOrCreatePlugin(
     }
     throw err;
   }
+}
+
+/**
+ * Lấy danh sách các plugin đủ điều kiện quét phiên bản từ xa.
+ * Điều kiện: enabled = true, resourceId không rỗng, và (nextScanAt IS NULL hoặc nextScanAt <= now).
+ */
+export async function listEligiblePluginsForScan(
+  db: Database,
+  now: Date = new Date(),
+  limit = 50,
+): Promise<Plugin[]> {
+  return await db
+    .select()
+    .from(plugins)
+    .where(
+      and(
+        eq(plugins.enabled, true),
+        sql`${plugins.resourceId} IS NOT NULL`,
+        or(
+          isNull(plugins.nextScanAt),
+          lte(plugins.nextScanAt, now),
+        ),
+      ),
+    )
+    .orderBy(asc(plugins.nextScanAt))
+    .limit(limit);
+}
+
+/**
+ * Cập nhật trạng thái và thời gian sau khi hoàn tất một lượt quét plugin.
+ */
+export async function updatePluginScanResult(
+  db: Database,
+  id: number,
+  params: {
+    lastScanAt: Date;
+    lastScanStatus: string;
+    lastScanError: string | null;
+    nextScanAt: Date;
+  },
+): Promise<Plugin | null> {
+  const updated = await db
+    .update(plugins)
+    .set({
+      lastScanAt: params.lastScanAt,
+      lastScanStatus: params.lastScanStatus,
+      lastScanError: params.lastScanError,
+      nextScanAt: params.nextScanAt,
+      updatedAt: new Date(),
+    })
+    .where(eq(plugins.id, id))
+    .returning();
+
+  return updated[0] ?? null;
 }

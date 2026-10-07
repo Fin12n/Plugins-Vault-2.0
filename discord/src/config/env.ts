@@ -377,6 +377,20 @@ export const envSchema = z.object({
   CARD2K_COMMAND_CHARGE: z.string().default(''),
   CARD2K_COMMAND_CHECK: z.string().default(''),
   CARD2K_TIMEOUT_MS: intWithDefault(20_000, 1_000, 120_000),
+
+  // Scanner (Phase 5B)
+  SCANNER_ENABLED: z
+    .enum(['true', 'false', '1', '0'])
+    .optional()
+    .default('true')
+    .transform((v) => v === 'true' || v === '1'),
+  SCANNER_DEFAULT_INTERVAL_SECONDS: intWithDefault(3600, 60, 86400),
+  SCANNER_MAX_CONCURRENCY: intWithDefault(5, 1, 50),
+  SCANNER_REQUEST_TIMEOUT_MS: intWithDefault(10_000, 1_000, 60_000),
+  SCANNER_MAX_RETRIES: intWithDefault(3, 0, 10),
+  SCANNER_BASE_RETRY_DELAY_MS: intWithDefault(250, 50, 10_000),
+  SCANNER_MAX_RETRY_DELAY_MS: intWithDefault(5_000, 500, 60_000),
+  SCANNER_JITTER_MAX_SECONDS: intWithDefault(60, 0, 300),
 });
 
 export type Env = z.infer<typeof envSchema>;
