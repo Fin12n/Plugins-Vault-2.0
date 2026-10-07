@@ -1,12 +1,37 @@
 import { InferSelectModel, InferInsertModel } from "drizzle-orm";
 import * as schema from "./schema.js";
 
-// Plugin Types
+// Plugin & Version Types
 export type Plugin = InferSelectModel<typeof schema.plugins>;
 export type NewPlugin = InferInsertModel<typeof schema.plugins>;
 
 export type Version = InferSelectModel<typeof schema.versions>;
 export type NewVersion = InferInsertModel<typeof schema.versions>;
+
+// Canonical Aliases
+export type PluginVersion = Version;
+export type NewPluginVersion = NewVersion;
+
+// Canonical Artifact Types (Phase 5A)
+export type ArtifactStatus =
+  | 'PENDING'
+  | 'DOWNLOADING'
+  | 'VERIFYING'
+  | 'READY'
+  | 'FAILED'
+  | 'CORRUPT';
+
+export type PluginArtifact = InferSelectModel<typeof schema.pluginArtifacts>;
+export type NewPluginArtifact = InferInsertModel<typeof schema.pluginArtifacts>;
+
+// Canonical Entitlement Types (Phase 5A)
+export type EntitlementStatus = 'ACTIVE' | 'REVOKED' | 'SUSPENDED';
+
+export type PluginEntitlement = InferSelectModel<typeof schema.pluginEntitlements>;
+export type NewPluginEntitlement = InferInsertModel<typeof schema.pluginEntitlements>;
+
+// Source abstraction
+export type PluginSource = 'spigot' | 'paper' | 'velocity' | 'bungee' | 'custom' | string;
 
 export type ManualUpload = InferSelectModel<typeof schema.manualUploads>;
 export type NewManualUpload = InferInsertModel<typeof schema.manualUploads>;

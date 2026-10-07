@@ -1,4 +1,4 @@
-import { eq, or, ilike, desc, sql } from "drizzle-orm";
+import { eq, and, or, ilike, desc, sql } from "drizzle-orm";
 import type { Database } from "../db/neon.js";
 import { plugins, versions, type Plugin, type NewPlugin } from "@vault/db";
 
@@ -229,6 +229,12 @@ export async function listPluginsWithVersionStats(
       isPremium: plugins.isPremium,
       description: plugins.description,
       spigotLink: plugins.spigotLink,
+      enabled: plugins.enabled,
+      scanIntervalSeconds: plugins.scanIntervalSeconds,
+      nextScanAt: plugins.nextScanAt,
+      lastScanAt: plugins.lastScanAt,
+      lastScanStatus: plugins.lastScanStatus,
+      lastScanError: plugins.lastScanError,
       createdAt: plugins.createdAt,
       updatedAt: plugins.updatedAt,
       versionCount: sql<number>`count(${versions.id})::int`,
@@ -282,4 +288,71 @@ export async function findPluginByAny(
     .limit(1);
 
   return byName[0] ?? null;
+}
+
+/**
+ * Tìm plugin theo source platform và source resource ID (e.g. platform='spigot', resourceId=12345).
+ */
+export async function findPluginBySourceIdentity(
+  db: Database,
+  platform: string,
+  resourceId: number,
+): Promise<Plugin | null> {
+  const result = await db
+    .select()
+    .from(plugins)
+    .where(
+      and(
+        eq(plugins.platform, platform),
+        eq(plugins.resourceId, resourceId),
+      ),
+    )
+    .limit(1);
+  return result[0] ?? null;
+}
+
+/**
+ * Lấy hoặc tạo mới Plugin theo cách lũy biến (idempotent getOrCreate).
+ * Khớp theo source identity (platform + resourceId) hoặc theo slug.
+ */
+export async function getOrCreatePlugin(
+  db: Database,
+  input: NewPlugin,
+): Promise<Plugin> {
+  // 1. Khớp theo external source identity nếu có
+  if (input.platform && input.resourceId !== undefined && input.resourceId !== null) {
+    const bySource = await findPluginBySourceIdentity(db, input.platform, input.resourceId);
+    if (bySource) return bySource;
+  }
+
+  // 2. Khớp theo slug duy nhất
+  if (input.slug) {
+    const bySlug = await findPluginBySlug(db, input.slug);
+    if (bySlug) return bySlug;
+  }
+
+  // 3. Khớp theo pluginId duy nhất
+  if (input.pluginId) {
+    const byPluginId = await findPluginByPluginId(db, input.pluginId);
+    if (byPluginId) return byPluginId;
+  }
+
+  // 4. Chèn mới với cơ chế an toàn concurrency
+  try {
+    return await createPlugin(db, input);
+  } catch (err: any) {
+    if (input.platform && input.resourceId !== undefined && input.resourceId !== null) {
+      const bySource = await findPluginBySourceIdentity(db, input.platform, input.resourceId);
+      if (bySource) return bySource;
+    }
+    if (input.slug) {
+      const bySlug = await findPluginBySlug(db, input.slug);
+      if (bySlug) return bySlug;
+    }
+    if (input.pluginId) {
+      const byPluginId = await findPluginByPluginId(db, input.pluginId);
+      if (byPluginId) return byPluginId;
+    }
+    throw err;
+  }
 }

@@ -71,3 +71,69 @@ export async function getLatestStableVersion(
     .limit(1);
   return result[0] ?? null;
 }
+
+/**
+ * Tìm phiên bản theo version_normalized.
+ */
+export async function findVersionByNormalized(
+  db: Database,
+  pluginId: number,
+  versionNormalized: string,
+): Promise<Version | null> {
+  const result = await db
+    .select()
+    .from(versions)
+    .where(
+      and(
+        eq(versions.pluginId, pluginId),
+        eq(versions.versionNormalized, versionNormalized),
+      ),
+    )
+    .limit(1);
+  return result[0] ?? null;
+}
+
+/**
+ * Lấy hoặc tạo mới Plugin Version theo cách lũy biến (idempotent getOrCreate).
+ * Khớp theo (pluginId, versionNormalized).
+ * Đảm bảo tính bất biến (immutability) của version identity: không update đè version cũ.
+ */
+export async function getOrCreatePluginVersion(
+  db: Database,
+  input: NewVersion,
+): Promise<Version> {
+  // 1. Kiểm tra theo normalized version
+  if (input.versionNormalized) {
+    const existing = await findVersionByNormalized(db, input.pluginId, input.versionNormalized);
+    if (existing) return existing;
+  }
+
+  // 2. Kiểm tra theo version string gốc
+  if (input.version) {
+    const existingByVer = await db
+      .select()
+      .from(versions)
+      .where(and(eq(versions.pluginId, input.pluginId), eq(versions.version, input.version)))
+      .limit(1);
+    if (existingByVer[0]) return existingByVer[0];
+  }
+
+  // 3. Chèn bản ghi mới với cơ chế an toàn concurrency
+  try {
+    return await createVersion(db, input);
+  } catch (err: any) {
+    if (input.versionNormalized) {
+      const existing = await findVersionByNormalized(db, input.pluginId, input.versionNormalized);
+      if (existing) return existing;
+    }
+    if (input.version) {
+      const existingByVer = await db
+        .select()
+        .from(versions)
+        .where(and(eq(versions.pluginId, input.pluginId), eq(versions.version, input.version)))
+        .limit(1);
+      if (existingByVer[0]) return existingByVer[0];
+    }
+    throw err;
+  }
+}

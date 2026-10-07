@@ -33,6 +33,12 @@ export const plugins = pgTable(
     isPremium: boolean("is_premium").default(false).notNull(),
     description: text("description").default("").notNull(),
     spigotLink: text("spigot_link").default("").notNull(),
+    enabled: boolean("enabled").default(true).notNull(),
+    scanIntervalSeconds: integer("scan_interval_seconds").default(3600).notNull(),
+    nextScanAt: timestamp("next_scan_at", { withTimezone: true }),
+    lastScanAt: timestamp("last_scan_at", { withTimezone: true }),
+    lastScanStatus: varchar("last_scan_status", { length: 32 }).default("idle").notNull(),
+    lastScanError: text("last_scan_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -40,6 +46,10 @@ export const plugins = pgTable(
     uniqueIndex("idx_plugins_plugin_id").on(table.pluginId),
     uniqueIndex("idx_plugins_slug").on(table.slug),
     index("idx_plugins_resource_id").on(table.resourceId),
+    uniqueIndex("idx_plugins_source_resource")
+      .on(table.platform, table.resourceId)
+      .where(sql`resource_id IS NOT NULL`),
+    index("idx_plugins_scan_schedule").on(table.enabled, table.nextScanAt),
     index("idx_plugins_descriptor_name").on(table.descriptorName),
     index("idx_plugins_aliases").using("gin", table.aliases),
   ]
@@ -53,7 +63,15 @@ export const versions = pgTable(
       .references(() => plugins.id, { onDelete: "cascade" })
       .notNull(),
     version: varchar("version", { length: 64 }),
+    versionNormalized: varchar("version_normalized", { length: 64 }),
     rawVersion: varchar("raw_version", { length: 128 }),
+    sourceVersionId: varchar("source_version_id", { length: 64 }),
+    sourceReleaseId: varchar("source_release_id", { length: 64 }),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+    metadata: jsonb("metadata").default({}).notNull(),
+    status: varchar("status", { length: 32 }).default("active").notNull(),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).defaultNow().notNull(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).defaultNow().notNull(),
     sha256: varchar("sha256", { length: 64 }).unique().notNull(),
     relPath: text("rel_path").notNull(),
     bytes: bigint("bytes", { mode: "number" }).notNull(),
@@ -64,13 +82,78 @@ export const versions = pgTable(
     changeLogs: text("change_logs").default("").notNull(),
     source: varchar("source", { length: 20 }).default("spigot_auto").notNull(),
     uploadedAt: timestamp("uploaded_at", { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex("idx_versions_plugin_version").on(table.pluginId, table.version),
+    uniqueIndex("idx_versions_plugin_version_normalized")
+      .on(table.pluginId, table.versionNormalized)
+      .where(sql`version_normalized IS NOT NULL`),
     index("idx_versions_plugin_id").on(table.pluginId),
     index("idx_versions_plugin_uploaded").on(table.pluginId, table.uploadedAt),
+    index("idx_versions_released_at").on(table.pluginId, table.releasedAt),
+    index("idx_versions_status").on(table.status),
     uniqueIndex("idx_versions_sha256").on(table.sha256),
     index("idx_versions_is_stable").on(table.isStable),
+  ]
+);
+
+// Alias canonical
+export const pluginVersions = versions;
+
+// ============================================================================
+// 1.1 CANONICAL ARTIFACTS & ENTITLEMENTS (PHASE 5A)
+// ============================================================================
+export const pluginArtifacts = pgTable(
+  "plugin_artifacts",
+  {
+    id: serial("id").primaryKey(),
+    pluginVersionId: integer("plugin_version_id")
+      .references(() => versions.id, { onDelete: "cascade" })
+      .notNull(),
+    storageKey: text("storage_key").notNull(),
+    filename: varchar("filename", { length: 255 }).notNull(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    sha256: varchar("sha256", { length: 64 }).notNull(),
+    mimeType: varchar("mime_type", { length: 64 }).default("application/java-archive").notNull(),
+    jarValid: boolean("jar_valid").default(false).notNull(),
+    status: varchar("status", { length: 32 }).default("PENDING").notNull(), // PENDING | DOWNLOADING | VERIFYING | READY | FAILED | CORRUPT
+    downloadedAt: timestamp("downloaded_at", { withTimezone: true }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_plugin_artifacts_version").on(table.pluginVersionId),
+    index("idx_plugin_artifacts_sha256").on(table.sha256),
+    index("idx_plugin_artifacts_status").on(table.status),
+  ]
+);
+
+export const pluginEntitlements = pgTable(
+  "plugin_entitlements",
+  {
+    id: serial("id").primaryKey(),
+    userId: varchar("user_id", { length: 32 }).notNull(), // discord_user_id
+    pluginVersionId: integer("plugin_version_id")
+      .references(() => versions.id, { onDelete: "cascade" })
+      .notNull(),
+    orderId: integer("order_id").references(() => orders.id, {
+      onDelete: "set null",
+    }),
+    status: varchar("status", { length: 20 }).default("ACTIVE").notNull(), // ACTIVE | REVOKED | SUSPENDED
+    grantedAt: timestamp("granted_at", { withTimezone: true }).defaultNow().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("idx_plugin_entitlements_user_version").on(table.userId, table.pluginVersionId),
+    index("idx_plugin_entitlements_user").on(table.userId),
+    index("idx_plugin_entitlements_version").on(table.pluginVersionId),
+    index("idx_plugin_entitlements_status").on(table.status),
+    index("idx_plugin_entitlements_order").on(table.orderId),
   ]
 );
 
@@ -628,11 +711,34 @@ export const versionsRelations = relations(versions, ({ one, many }) => ({
     fields: [versions.pluginId],
     references: [plugins.id],
   }),
+  artifact: one(pluginArtifacts, {
+    fields: [versions.id],
+    references: [pluginArtifacts.pluginVersionId],
+  }),
+  entitlements: many(pluginEntitlements),
   orders: many(orders),
   manualUploads: many(manualUploads),
   deliveryJobs: many(deliveryJobs),
   deliveryLogs: many(deliveryLogs),
   downloadTokens: many(downloadTokens),
+}));
+
+export const pluginArtifactsRelations = relations(pluginArtifacts, ({ one }) => ({
+  version: one(versions, {
+    fields: [pluginArtifacts.pluginVersionId],
+    references: [versions.id],
+  }),
+}));
+
+export const pluginEntitlementsRelations = relations(pluginEntitlements, ({ one }) => ({
+  version: one(versions, {
+    fields: [pluginEntitlements.pluginVersionId],
+    references: [versions.id],
+  }),
+  order: one(orders, {
+    fields: [pluginEntitlements.orderId],
+    references: [orders.id],
+  }),
 }));
 
 export const manualUploadsRelations = relations(manualUploads, ({ one }) => ({
