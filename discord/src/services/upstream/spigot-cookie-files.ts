@@ -1,6 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { BrowserPage } from './download-via-browser.js';
+import {
+  atomicWriteJsonFile,
+  validateAndParseCookies,
+  quarantineCorruptedFile,
+  sessionRecoveryManager,
+} from './session-recovery-manager.js';
 
 export interface SpigotCookieItem {
   name: string;
@@ -63,8 +69,10 @@ export function saveAccountCookiesToFile(
     ...metadata,
   };
 
-  writeFileSync(cookieFile, JSON.stringify(cookies, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  writeFileSync(sessionFile, JSON.stringify(fullMetadata, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  atomicWriteJsonFile(cookieFile, cookies);
+  atomicWriteJsonFile(sessionFile, fullMetadata);
+
+  sessionRecoveryManager.setState(accountLabel, 'VALID');
 
   return { cookieFile, sessionFile };
 }
@@ -84,7 +92,18 @@ export function loadAccountCookiesFromFile(
 
   try {
     const rawCookies = readFileSync(cookieFile, 'utf-8');
-    const cookies = JSON.parse(rawCookies) as SpigotCookieItem[];
+    const validation = validateAndParseCookies(rawCookies);
+    if (!validation.valid || !validation.cookies) {
+      console.warn(`[CookieStorage] Phát hiện tệp cookie bị hỏng cho "${accountLabel}": ${validation.error}. Tiến hành cô lập.`);
+      quarantineCorruptedFile(cookieFile);
+      sessionRecoveryManager.setState(accountLabel, 'QUARANTINED');
+      return null;
+    }
+
+    const cookies = validation.cookies;
+    if (sessionRecoveryManager.getState(accountLabel) !== 'READY') {
+      sessionRecoveryManager.setState(accountLabel, 'VALID');
+    }
 
     let metadata: SpigotSessionMetadata | null = null;
     if (existsSync(sessionFile)) {
@@ -97,7 +116,9 @@ export function loadAccountCookiesFromFile(
 
     return { cookies, metadata };
   } catch (err) {
-    console.warn(`[CookieStorage] Không thể đọc cookies từ ${cookieFile}:`, err instanceof Error ? err.message : String(err));
+    console.warn(`[CookieStorage] Lỗi không mong đợi khi đọc cookie từ ${cookieFile}:`, err instanceof Error ? err.message : String(err));
+    quarantineCorruptedFile(cookieFile);
+    sessionRecoveryManager.setState(accountLabel, 'QUARANTINED');
     return null;
   }
 }
